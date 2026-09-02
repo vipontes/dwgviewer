@@ -104,6 +104,32 @@ alongside the exe with:
 C:\Qt\6.11.2\msvc2022_64\bin\windeployqt.exe build\Release\dwgviewer.exe
 ```
 
+**Distributing the exe to another machine:** `windeployqt` (above) is the
+reliable way to gather what's needed — it scans the exe's actual
+dependencies rather than relying on a hand-picked list, so it stays correct
+across Qt versions and future code changes. It copies these into
+`build\Release\` alongside `dwgviewer.exe`:
+
+- Qt DLLs: `Qt6Core.dll`, `Qt6Gui.dll`, `Qt6Widgets.dll`, `Qt6Network.dll`,
+  `Qt6Svg.dll`, `opengl32sw.dll` (software OpenGL fallback),
+  `D3Dcompiler_47.dll`.
+- Qt plugins, as subfolders (Qt loads these by scanning directories next to
+  the exe, so the folder structure matters, not just the loose DLLs):
+  `platforms\qwindows.dll` (mandatory — the app won't start without it),
+  `styles\qmodernwindowsstyle.dll`, `imageformats\*.dll`,
+  `iconengines\qsvgicon.dll`, `tls\*.dll`, `networkinformation\*.dll`,
+  `generic\qtuiotouchplugin.dll`.
+- `translations\*.qm` — optional, only needed to localize Qt's built-in
+  dialogs (file picker, message boxes).
+
+Zip up that whole `build\Release\` folder and it'll run on another machine
+— with one more requirement `windeployqt` doesn't cover: this build links
+the MSVC runtime dynamically (CMake's default), so the target machine also
+needs `vcruntime140.dll`, `vcruntime140_1.dll`, and `msvcp140.dll`. These
+come from Visual Studio, not Qt — either have the target machine install
+the [VC++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe),
+or copy those three DLLs from `C:\Windows\System32` alongside the exe.
+
 ## Running
 
 ```bash

@@ -36,3 +36,13 @@ add_executable(dwgviewer
     src/viewer_widget.h
 )
 target_link_libraries(dwgviewer PRIVATE Qt6::Widgets dxfrw)
+
+if(WIN32)
+    # Default MSVC subsystem is Console, which pops a console window
+    # alongside the GUI on every launch (including double-click from
+    # Explorer). WIN32_EXECUTABLE switches to the Windows subsystem instead;
+    # main.cpp re-attaches to the parent console when launched from one
+    # (cmd/PowerShell), so stderr diagnostics and --png output still show up
+    # there.
+    set_target_properties(dwgviewer PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
