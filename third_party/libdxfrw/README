@@ -1,0 +1,26 @@
+libdxfrw
+
+libdxfrw is a free C++ library to read and write DXF files in both formats, ascii and binary form.
+It also has DWG read/write support in LibreCAD's in-tree fork. See
+DWG_REFERENCE_COVERAGE_STATUS.md and DWG_ROADMAP.md for current DWG coverage
+notes.
+It is licensed under the terms of the GNU General Public License version 2 (or at your option
+any later version).
+
+
+If you are looking for historical information about the project, check:
+http://sourceforge.net/projects/libdxfrw
+
+== Building and installing the library ==
+
+Use the typical
+./configure
+make
+make install (as root)
+
+For LibreCAD's in-tree fork, the top-level LibreCAD CMake build is the primary
+tested build definition.
+
+== Example usage of the library ==
+
+See LibreCAD's DXF/DWG filter integration in librecad/src/lib/filters/.

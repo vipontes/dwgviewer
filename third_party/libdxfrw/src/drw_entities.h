@@ -1,0 +1,3068 @@
+/******************************************************************************
+**  libDXFrw - Library to read/write DXF files (ascii & binary)              **
+**                                                                           **
+**  Copyright (C) 2016-2022 A. Stebich (librecad@mail.lordofbikes.de)        **
+**  Copyright (C) 2011-2015 José F. Soriano, rallazz@gmail.com               **
+**  Copyright (C) 2026 LibreCAD (librecad.org)                                **
+**                                                                           **
+**  This library is free software, licensed under the terms of the GNU       **
+**  General Public License as published by the Free Software Foundation,     **
+**  either version 2 of the License, or (at your option) any later version.  **
+**  You should have received a copy of the GNU General Public License        **
+**  along with this program.  If not, see <http://www.gnu.org/licenses/>.    **
+******************************************************************************/
+
+#ifndef DRW_ENTITIES_H
+#define DRW_ENTITIES_H
+
+
+#include <array>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
+#include "drw_base.h"
+#include "drw_objects.h"
+#include "drw_acis.h"
+
+class dxfReader;
+class dwgBuffer;
+class DRW_Polyline;
+class DRW_MText;
+
+namespace DRW {
+
+   //! Entity's type.
+    enum ETYPE {
+        E3DFACE,
+        E3DSOLID,
+//        ACAD_PROXY_ENTITY,
+        ARC,
+        ATTDEF,
+        ATTRIB,
+        BLOCK,// and ENDBLK
+        BODY,
+        CIRCLE,
+        DIMENSION,
+        DIMALIGNED,
+        DIMLINEAR,
+        DIMRADIAL,
+        DIMDIAMETRIC,
+        DIMANGULAR,
+        DIMANGULAR3P,
+        DIMORDINATE,
+        DIMARC,
+        ELLIPSE,
+        HATCH,
+        HELIX,
+        IMAGE,
+        INSERT,
+        LEADER,
+        LIGHT,
+        LINE,
+        LWPOLYLINE,
+        MESH,
+        MLINE,
+//        MLEADERSTYLE,
+        MLEADER,
+        MTEXT,
+//        OLEFRAME,
+        OLE2FRAME,
+        POINT,
+        POLYLINE,
+        RAY,
+        REGION,
+        SECTION,
+        SEQEND,
+        SHAPE,
+        SOLID,
+        SPLINE,
+//        SURFACE, //encrypted proprietary data can be four types
+        TABLE,
+        TEXT,
+        TOLERANCE,
+        DXF_TRACE,
+        UNDERLAY,
+        VERTEX,
+        VIEWPORT,
+        WIPEOUT,
+        XLINE,
+        MPOLYGON,
+        POINTCLOUD,
+        POINTCLOUDEX,
+        PLANESURFACE,
+        EXTRUDEDSURFACE,
+        REVOLVEDSURFACE,
+        SWEPTSURFACE,
+        LOFTEDSURFACE,
+        NURBSURFACE,
+        UNKNOWN
+    };
+
+}
+//only in DWG: MINSERT, 5 types of vertex, 4 types of polylines: 2d, 3d, pface & mesh
+//shape, dictionary, MLEADER, MLEADERSTYLE
+
+class dwgBufferW;
+class DrwEntityEncodeTestAccess;  // test-only friend; defined in
+                                  // dwg_entity_encode_round_trip_tests.cpp
+class DrwVisibilityTestAccess;    // test-only friend; defined in
+                                  // dwg_visibility_read_tests.cpp
+
+#define SETENTFRIENDS  friend class dxfRW; \
+                       friend class dwgReader; \
+                       friend class dwgWriter15; \
+                       friend class dwgWriter24; \
+                       friend class DrwEntityEncodeTestAccess; \
+                       friend class DrwVisibilityTestAccess;
+
+//! Base class for entities
+/*!
+*  Base class for entities
+*  @author Rallaz
+*/
+class DRW_Entity {
+    SETENTFRIENDS
+public:
+    //initializes default values
+	DRW_Entity() = default;
+	virtual ~DRW_Entity() = default;
+
+	//removed copy/move ctors
+	// looks like the potential issue is the "curr" pointer is reset in previous
+	// versions during copy ctor
+
+	void reset() {
+		extData.clear();
+		pendingAppIdResolutions.clear();
+		pendingLayerRefResolutions.clear();
+		curr.reset();
+	}
+
+    virtual void applyExtrusion() = 0;
+
+protected:
+    //parses dxf pair to read entity
+    virtual bool parseCode(int code, const std::unique_ptr<dxfReader>& reader);
+    //calculates extrusion axis (normal vector)
+    void calculateAxis(DRW_Coord extPoint);
+    //apply extrusion to @extPoint and return data in @point
+    void extrudePoint(DRW_Coord extPoint, DRW_Coord *point);
+    [[nodiscard]] virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0)=0;
+    //parses dwg common start part to read entity
+    [[nodiscard]] virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer* strBuf, std::uint32_t bs=0);
+    //parses dwg common handles part to read entity
+    [[nodiscard]] bool parseDwgEntHandle(DRW::Version version, dwgBuffer *buf, bool resetHandleStream = true);
+
+    // Writer-side inverses of parseDwg / parseDwgEntHandle.  Support
+    // AC1015, AC1018, and AC1024 (R2010).  For AC1024, strBuf receives
+    // string data (TV/TU) and handleBuf receives the handle stream; both
+    // are null for AC1015/AC1018 (single-buffer encoding).
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                            dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr)
+        { (void)version; (void)buf; (void)bs; (void)strBuf; (void)handleBuf; return false; }
+    // Emits dwg common start part for an entity.  strBuf only used for
+    // AC1024+ string-separation mode; pass nullptr for AC1015/AC1018.
+    bool encodeDwgCommon(DRW::Version version, dwgBufferW *buf,
+                         dwgBufferW *strBuf=nullptr);
+    // Emits dwg common handles part.  handleBuf receives handles for
+    // AC1024+; pass nullptr for AC1015/AC1018 (handles go to buf).
+    bool encodeDwgEntHandle(DRW::Version version, dwgBufferW *buf,
+                            dwgBufferW *handleBuf=nullptr);
+
+    //parses dxf 102 groups to read entity
+    bool parseDxfGroups(int code, const std::unique_ptr<dxfReader>& reader);
+
+public:
+	enum DRW::ETYPE eType = DRW::UNKNOWN;     /*!< enum: entity type, code 0 */
+	std::uint32_t handle = DRW::NoHandle;            /*!< entity identifier, code 5 */
+    std::list<std::list<DRW_Variant> > appData; /*!< list of application data, code 102 */
+	std::uint32_t parentHandle = DRW::NoHandle;      /*!< Soft-pointer ID/handle to owner BLOCK_RECORD object, code 330 */
+	DRW::Space space = DRW::ModelSpace;          /*!< space indicator, code 67*/
+	UTF8STRING layer = "0";          /*!< layer name, code 8 */
+	UTF8STRING lineType = "BYLAYER";       /*!< line type, code 6 */
+	std::uint32_t material = DRW::MaterialByLayer;          /*!< hard pointer id to material object, code 347 */
+	int color = DRW::ColorByLayer;                 /*!< entity color, code 62 */
+	enum DRW_LW_Conv::lineWidth lWeight = DRW_LW_Conv::widthByLayer; /*!< entity lineweight, code 370 */
+	double ltypeScale = 1.0;         /*!< linetype scale, code 48 */
+	bool visible = true;              /*!< entity visibility, code 60 */
+	int numProxyGraph = 0;         /*!< Number of bytes in proxy graphics, code 92 */
+    std::string proxyGraphics; /*!< proxy graphics bytes, code 310 */
+	int color24 = -1;               /*!< 24-bit color, code 420 */
+    std::string colorName;     /*!< color name, code 430 */
+	int transparency = DRW::Opaque;          /*!< transparency, code 440 */
+	int plotStyle = DRW::DefaultPlotStyle;             /*!< hard pointer id to plot style object, code 390 */
+	DRW::ShadowMode shadow = DRW::CastAndReceieveShadows;    /*!< shadow mode, code 284 */
+    std::uint32_t fullVisualStyleHandle{0}; /*!< R2010+ full visual-style ref, ODA §19.4.2 (DWG-only) */
+    std::uint32_t faceVisualStyleHandle{0}; /*!< R2010+ face visual-style ref */
+    std::uint32_t edgeVisualStyleHandle{0}; /*!< R2010+ edge visual-style ref */
+    std::vector<std::uint32_t> reactorHandles; /*!< persisted reactor handles (ODA §19.4.2); DWG round-trip (Phase 2a) */
+    std::uint32_t xDictHandle = 0;          /*!< extension-dictionary handle (ODA §19.4.2); DWG round-trip (Phase 2a) */
+	bool haveExtrusion = false;        /*!< set to true if the entity have extrusion*/
+	std::vector<std::shared_ptr<DRW_Variant>> extData; /*!< FIFO list of extended data, codes 1000 to 1071*/
+
+    /*!< Pending DWG-EED handle resolutions, populated by parseDwg() and
+     *   drained by dwgReader::parseAttribs(). Each entry records the
+     *   index of a placeholder variant in @ref extData that needs to be
+     *   replaced with a name resolved from the appid / layer maps. */
+    struct PendingHandleRef {
+        size_t indexInExtData;
+        std::uint32_t handleRef;
+    };
+    std::vector<PendingHandleRef> pendingAppIdResolutions;
+    std::vector<PendingHandleRef> pendingLayerRefResolutions;
+
+protected: //only for read dwg
+    std::uint8_t haveNextLinks = 0; //R13..R2002 nolinks (no prev/next chain when 1) //B
+    std::uint8_t hasDsData = 0; //R2013+ has_ds_data: 1 advertises inline ACIS SAB datastore //B
+    std::uint8_t plotFlags = 0; //presence of plot style //BB
+    std::uint8_t ltFlags = 0; //presence of linetype handle //BB
+    std::uint8_t materialFlag = 0; //presence of material handle //BB
+    std::uint8_t shadowFlag = 0; //R2007+ shadow mode 0..3 (cast/receive/both/ignore) //RC
+    std::uint8_t hasFullVisualStyle{0}; //R2010+ full visual-style handle present //B
+    std::uint8_t hasFaceVisualStyle{0}; //R2010+ face visual-style handle present //B
+    std::uint8_t hasEdgeVisualStyle{0}; //R2010+ edge visual-style handle present //B
+    bool   hasAcDbColorH{false};  //ENC flag 0x40 set: AcDbColor handle in hdl_dat
+    std::uint32_t acDbColorHandle{0};   //resolved offset handle if hasAcDbColorH
+    dwgHandle lTypeH;
+    dwgHandle layerH;
+	std::uint32_t nextEntLink = 0;
+	std::uint32_t prevEntLink = 0;
+	bool ownerHandle = false;
+
+	std::uint8_t xDictFlag = 0;
+	std::int32_t numReactors = 0; //
+    std::uint32_t objSize;  //RL 32bits object data size in bits
+    std::int16_t oType;
+
+private:
+	void init(DRW_Entity const& rhs);
+	DRW_Coord extAxisX;
+    DRW_Coord extAxisY;
+	std::shared_ptr<DRW_Variant> curr;
+};
+
+
+//! Class to handle point entity
+/*!
+*  Class to handle point entity
+*  @author Rallaz
+*/
+class DRW_Point : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Point() {
+        eType = DRW::POINT;
+        basePoint.z = extPoint.x = extPoint.y = 0;
+        extPoint.z = 1;
+        thickness = 0;
+    }
+
+    virtual void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    DRW_Coord basePoint;      /*!<  base point, code 10, 20 & 30 */
+    double thickness;         /*!< thickness, code 39 */
+    DRW_Coord extPoint;       /*!<  Dir extrusion normal vector, code 210, 220 & 230 */
+    double xAxisAngle = 0.0;  /*!< angle of X axis for UCS in effect, code 50, radians */
+};
+
+//! Class to handle line entity
+/*!
+*  Class to handle line entity
+*  @author Rallaz
+*/
+class DRW_Line : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Line() {
+        eType = DRW::LINE;
+        secPoint.z = 0;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    DRW_Coord secPoint;        /*!< second point, code 11, 21 & 31 */
+};
+
+//! Class to handle ray entity
+/*!
+*  Class to handle ray entity
+*  @author Rallaz
+*/
+class DRW_Ray : public DRW_Line {
+    SETENTFRIENDS
+public:
+    DRW_Ray() {
+        eType = DRW::RAY;
+    }
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle xline entity
+/*!
+*  Class to handle xline entity
+*  @author Rallaz
+*/
+class DRW_Xline : public DRW_Ray {
+public:
+    DRW_Xline() {
+        eType = DRW::XLINE;
+    }
+};
+
+//! Class to handle circle entity
+/*!
+*  Class to handle circle entity
+*  @author Rallaz
+*/
+class DRW_Circle : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Circle() {
+        eType = DRW::CIRCLE;
+    }
+
+    virtual void applyExtrusion() override;
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double radious = 0.0;           /*!< radius, code 40 */
+};
+
+//! Class to handle arc entity
+/*!
+*  Class to handle arc entity
+*  @author Rallaz
+*/
+class DRW_Arc : public DRW_Circle {
+    SETENTFRIENDS
+public:
+    DRW_Arc() {
+        eType = DRW::ARC;
+        isccw = 1;
+    }
+
+    virtual void applyExtrusion() override;
+
+    //! center point in OCS
+    const DRW_Coord & center() { return basePoint; }
+    //! the radius of the circle
+    double radius() { return radious; }
+    //! start angle in radians
+    double startAngle() { return staangle; }
+    //! end angle in radians
+    double endAngle() { return endangle; }
+    //! thickness
+    double thick() { return thickness; }
+    //! extrusion
+    const DRW_Coord & extrusion() { return extPoint; }
+
+protected:
+    //! interpret code in dxf reading process or dispatch to inherited class
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    //! interpret dwg data (was already determined to be part of this object)
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double staangle = 0.0;      /*!< start angle, code 50 in radians*/
+    double endangle = 0.0;      /*!< end angle, code 51 in radians */
+    int isccw;                  /*!< is counter clockwise arc?, only used in hatch, code 73 */
+};
+
+//! Class to handle ellipse entity
+/*!
+*  Class to handle ellipse and elliptic arc entity
+*  Note: start/end parameter are in radians for ellipse entity but
+*  for hatch boundary are in degrees
+*  @author Rallaz
+*/
+class DRW_Ellipse : public DRW_Line {
+    SETENTFRIENDS
+public:
+    DRW_Ellipse() {
+        eType = DRW::ELLIPSE;
+        isccw = 1;
+    }
+
+    void toPolyline(DRW_Polyline *pol, int parts = 128);
+    virtual void applyExtrusion() override;
+
+protected:
+    //! interpret code in dxf reading process or dispatch to inherited class
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    //! interpret dwg data (was already determined to be part of this object)
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+private:
+    void correctAxis();
+
+public:
+    double ratio = 1.0;  /*!< ratio, code 40 */
+    double staparam = 0.0;     /*!< start parameter, code 41, 0.0 for full ellipse*/
+    double endparam = 0.0;     /*!< end parameter, code 42, 2*PI for full ellipse */
+    int isccw;           /*!< is counter clockwise arc?, only used in hatch, code 73 */
+};
+
+//! Class to handle trace entity
+/*!
+*  Class to handle trace entity
+*  @author Rallaz
+*/
+class DRW_Trace : public DRW_Line {
+    SETENTFRIENDS
+public:
+    DRW_Trace() {
+        eType = DRW::DXF_TRACE;
+        thirdPoint.z = 0;
+        fourPoint.z = 0;
+    }
+
+    virtual void applyExtrusion() override;
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    DRW_Coord thirdPoint;        /*!< third point, code 12, 22 & 32 */
+    DRW_Coord fourPoint;        /*!< four point, code 13, 23 & 33 */
+};
+
+//! Class to handle solid entity
+/*!
+*  Class to handle solid entity
+*  @author Rallaz
+*/
+class DRW_Solid : public DRW_Trace {
+    SETENTFRIENDS
+public:
+    DRW_Solid() {
+        eType = DRW::SOLID;
+    }
+
+protected:
+    //! interpret dwg data (was already determined to be part of this object)
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    //! first corner (2D)
+    const DRW_Coord & firstCorner() { return basePoint; }
+    //! second corner (2D)
+    const DRW_Coord & secondCorner() { return secPoint; }
+    //! third corner (2D)
+    const DRW_Coord & thirdCorner() { return thirdPoint; }
+    //! fourth corner (2D)
+    const DRW_Coord & fourthCorner() { return fourPoint; }
+    //! thickness
+    double thick() { return thickness; }
+    //! elevation
+    double elevation() { return basePoint.z; }
+    //! extrusion
+    const DRW_Coord & extrusion() { return extPoint; }
+
+};
+
+//! Class to handle 3dface entity
+/*!
+*  Class to handle 3dface entity
+*  @author Rallaz
+*/
+class DRW_3Dface : public DRW_Trace {
+    SETENTFRIENDS
+public:
+    enum InvisibleEdgeFlags {
+        NoEdge = 0x00,
+        FirstEdge = 0x01,
+        SecodEdge = 0x02,
+        ThirdEdge = 0x04,
+        FourthEdge = 0x08,
+        AllEdges = 0x0F
+    };
+
+    DRW_3Dface() {
+        eType = DRW::E3DFACE;
+        invisibleflag = 0;
+    }
+
+    //! first corner in WCS
+    const DRW_Coord & firstCorner() { return basePoint; }
+    //! second corner in WCS
+    const DRW_Coord & secondCorner() { return secPoint; }
+    //! third corner in WCS
+    const DRW_Coord & thirdCorner() { return thirdPoint; }
+    //! fourth corner in WCS
+    const DRW_Coord & fourthCorner() { return fourPoint; }
+    //! edge visibility flags
+    InvisibleEdgeFlags edgeFlags() { return (InvisibleEdgeFlags)invisibleflag; }
+
+protected:
+    //! interpret code in dxf reading process or dispatch to inherited class
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    //! interpret dwg data (was already determined to be part of this object)
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    int invisibleflag;       /*!< invisible edge flag, code 70 */
+
+};
+
+//! Byte range hint for opaque ACIS/SAB modeler payload sections.
+struct DRW_ModelerPayloadRange {
+    enum class Kind {
+        Sat,
+        Sab,
+        History,
+        Wire,
+        Silhouette,
+        UnknownTail,
+        HandleStream
+    };
+
+    enum class Section {
+        Body,
+        HandleStream,
+        Unknown
+    };
+
+    enum class Consistency {
+        Unknown,
+        Exact,
+        Truncated,
+        Overrun
+    };
+
+    enum class Confidence {
+        Unknown,
+        Marker,
+        DeclaredSize,
+        Inferred
+    };
+
+    Kind m_kind = Kind::UnknownTail;
+    Section m_section = Section::Unknown;
+    size_t m_offset = 0;
+    size_t m_length = 0;
+    size_t m_declaredByteSize = 0;
+    Consistency m_consistency = Consistency::Unknown;
+    Confidence m_confidence = Confidence::Unknown;
+    std::string m_markerText;
+};
+
+//! Opaque ACIS/SAB modeler geometry entity shell (REGION, 3DSOLID, BODY).
+class DRW_ModelerGeometry : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    explicit DRW_ModelerGeometry(DRW::ETYPE type = DRW::REGION) {
+        eType = type;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+
+public:
+    std::uint16_t m_modelerVersion = 0;
+    std::uint32_t m_bodyBitSize = 0;
+    std::uint32_t m_objectSize = 0;
+    bool m_isEmpty = false;
+    bool m_hasModelerData = false;
+    bool m_modelerDataUnknownBit = false;
+    bool m_hasWireframe = false;
+    std::uint32_t m_historyHandle = 0;
+    std::vector<std::uint8_t> m_rawBytes;
+    std::vector<DRW_ModelerPayloadRange> m_payloadRanges;
+
+    //! Lazily-decoded ACIS wireframe (from m_rawBytes SAB payload).
+    DRW_AcisBrep m_wireframe;
+    bool m_wireframeDecoded = false;
+    //! Decode the SAB wireframe from m_rawBytes on demand. Idempotent; never throws.
+    bool decodeWireframe() {
+        if (!m_wireframeDecoded) {
+            m_wireframeDecoded = true;
+            drw_decodeAcisWireframe(m_rawBytes, m_wireframe);
+        }
+        return !m_wireframe.empty();
+    }
+};
+
+//! MESH entity (AcDbSubDMesh) — subdivision-surface mesh.
+/*!
+*  Unlike ACIS solids, a MESH carries full vertex/face/edge topology, so it is
+*  decodable to real geometry. Renderable: LibreCAD decomposes the base-cage
+*  faces into polylines. DWG custom class "MESH"/"AcDbSubDMesh" appears in
+*  real AC1018 save-downs, so writing is not gated to AC1024+.
+*  @author LibreCAD
+*/
+class DRW_Mesh : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Mesh() { eType = DRW::MESH; }
+    static constexpr std::uint16_t kDwgClassNum = 520; /*!< AcDbSubDMesh DWG custom class id */
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    std::uint16_t version = 2;          /*!< subdivision-mesh version, code 71 */
+    bool blendCrease = false;           /*!< blend-crease flag, code 72 */
+    std::int32_t subdivisionLevel = 0;  /*!< subdivision level, code 91 */
+    std::vector<DRW_Coord> subdivVertices;  /*!< refined vertices (code 10, count 91) */
+    std::vector<DRW_Coord> vertices;        /*!< base-cage vertices (code 10, count 92) */
+    /*!< each face = list of vertex indices into `vertices` (flat stream, count 93) */
+    std::vector<std::vector<std::int32_t>> faces;
+    std::vector<std::pair<std::int32_t,std::int32_t>> edges;  /*!< edge index pairs, count 94 */
+    std::vector<double> creases;        /*!< per-edge crease values, code 140, count 95 */
+
+private:
+    // DXF parseCode accumulation state (codes are interleaved/sequenced).
+    int m_dxfState = 0;  // 0=none, 93=reading faces, 94=reading edges
+    std::int32_t m_dxfPending = 0;  // remaining items in current 90-stream
+    std::int32_t m_dxfEdgeFrom = -1;  // half-read edge pair
+};
+
+//! SHAPE entity shell. The SHX glyph itself is not interpreted here.
+class DRW_Shape : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Shape() {
+        eType = DRW::SHAPE;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    DRW_Coord m_insertionPoint;
+    double m_scale = 1.0;
+    double m_rotation = 0.0;
+    double m_widthFactor = 1.0;
+    double m_oblique = 0.0;
+    double m_thickness = 0.0;
+    std::uint16_t m_shapeIndex = 0;
+    DRW_Coord m_extrusion {0.0, 0.0, 1.0};
+    std::uint32_t m_shapeFileHandle = 0;
+    std::string m_styleName;  /*!< name of the SHAPEFILE/STYLE record (DXF code 2);
+                                   resolved from m_shapeFileHandle on DWG read. The
+                                   DWG stores only m_shapeIndex; the per-glyph name
+                                   lives in the external .shx, so DXF round-trips the
+                                   style-record name (as libredwg/ACadSharp do). */
+    std::uint32_t m_objectSize = 0;
+    std::uint32_t m_bodyBitSize = 0;
+    std::vector<std::uint8_t> m_rawBytes;
+};
+
+//! OLE2FRAME entity shell. The OLE compound payload remains opaque.
+class DRW_Ole2Frame : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    static constexpr std::uint32_t kMaxOlePayloadBytes = 128u * 1024u * 1024u;
+
+    DRW_Ole2Frame() {
+        eType = DRW::OLE2FRAME;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+
+public:
+    std::uint16_t m_flags = 0;
+    std::uint16_t m_mode = 0;
+    std::uint32_t m_declaredPayloadLength = 0;
+    std::uint32_t m_payloadByteCount = 0;
+    std::uint64_t m_payloadStartBit = 0;
+    bool m_payloadPresent = false;
+    bool m_payloadTruncated = false;
+    bool m_payloadTooLarge = false;
+    bool m_hasR2000TrailingByte = false;
+    std::uint8_t m_r2000TrailingByte = 0;
+    std::uint32_t m_objectSize = 0;
+    std::uint32_t m_bodyBitSize = 0;
+    std::vector<std::uint8_t> m_rawBytes;
+    std::vector<std::uint8_t> m_payloadBytes; /*!< opaque OLE payload, captured on read (Phase 6.2) */
+    // DXF fields. m_flags is the OLE object type (DXF 71); m_mode is tile mode
+    // (DXF 72); m_r2000TrailingByte is lock_aspect (DXF 73). oleVersion (70) and
+    // oleClient (3) are effectively constant. pt1/pt2 (DXF 10/11) are the frame
+    // rectangle, NOT stored as DWG fields — decoded from the OLE payload header.
+    std::uint16_t m_oleVersion = 2;     /*!< DXF 70 */
+    std::string   m_oleClient = "OLE";  /*!< DXF 3  */
+    DRW_Coord     m_pt1;                /*!< DXF 10/20/30 upper-left  */
+    DRW_Coord     m_pt2;                /*!< DXF 11/21/31 lower-right */
+
+protected:
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! LIGHT entity shell. LibreCAD does not render lights, but preserves metadata.
+class DRW_Light : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    static constexpr std::uint16_t kDwgClassNum = 502;
+    DRW_Light() {
+        eType = DRW::LIGHT;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version v, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr,
+                   dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    std::uint32_t m_classVersion = 0;
+    UTF8STRING m_name;
+    std::uint32_t m_type = 0;
+    bool m_status = false;
+    std::uint32_t m_color = 0;
+    bool m_plotGlyph = false;
+    double m_intensity = 0.0;
+    DRW_Coord m_position;
+    DRW_Coord m_target;
+    std::uint32_t m_attenuationType = 0;
+    bool m_useAttenuationLimits = false;
+    double m_attenuationStartLimit = 0.0;
+    double m_attenuationEndLimit = 0.0;
+    double m_hotspotAngle = 0.0;
+    double m_falloffAngle = 0.0;
+    bool m_castShadows = false;
+    std::uint32_t m_shadowType = 0;
+    std::uint16_t m_shadowMapSize = 0;
+    std::uint8_t m_shadowMapSoftness = 0;
+    bool m_hasPhotometricData = false;
+    bool m_hasWebFile = false;
+    UTF8STRING m_webFile;
+    std::uint16_t m_physicalIntensityMethod = 0;
+    double m_physicalIntensity = 0.0;
+    double m_illuminanceDistance = 0.0;
+    std::uint16_t m_lampColorType = 0;
+    double m_lampColorTemperature = 0.0;
+    std::uint16_t m_lampColorPreset = 0;
+    DRW_Coord m_webRotation{1.0, 0.0, 0.0};
+    std::uint16_t m_extendedLightShape = 0;
+    double m_extendedLightLength = 0.0;
+    double m_extendedLightWidth = 0.0;
+    double m_extendedLightRadius = 0.0;
+};
+
+//! SECTIONOBJECT (AcDbSection) live-section plane entity.
+/*!
+*  LibreCAD does not render the section plane, but the typed decode restores
+*  the section geometry (plane vertices + back-line vertices), the display
+*  metadata and the section_settings hard reference for parity with dwgTs.
+*  The raw shelf still preserves the object byte-for-byte for round-trip.
+*/
+class DRW_SectionObject : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_SectionObject() {
+        eType = DRW::SECTION;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+
+public:
+    std::uint32_t m_state = 0;            /*!< state flags, code 90 */
+    std::uint32_t m_flags = 0;            /*!< section flags, code 91 */
+    UTF8STRING m_name;                    /*!< section name, code 1 */
+    DRW_Coord m_vertDir;                  /*!< vertical direction, code 10 (3BD) */
+    double m_topHeight = 0.0;             /*!< top height, code 40 */
+    double m_bottomHeight = 0.0;          /*!< bottom height, code 41 */
+    std::uint16_t m_indicatorAlpha = 0;   /*!< indicator transparency, code 70 */
+    std::uint32_t m_indicatorColor = 0;   /*!< indicator color, code 62 (CMTC) */
+    std::vector<DRW_Coord> m_verts;       /*!< section-line vertices, code 11 */
+    std::vector<DRW_Coord> m_blVerts;     /*!< back-line vertices, code 12 */
+    std::uint32_t m_sectionSettingsHandle = 0; /*!< AcDbSectionSettings, code 360 */
+};
+
+//! Class to handle TOLERANCE entries
+/*!
+*  Class to handle tolerance entities (geometric dimensioning tolerance).
+*/
+class DRW_Tolerance : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Tolerance() {
+        eType = DRW::TOLERANCE;
+        extPoint.x = 0;
+        extPoint.y = 0;
+        extPoint.z = 1;
+        dimStyleName = "STANDARD";
+    }
+    virtual void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING text;                  /*!< Visual representation of the tolerance, code 1 */
+    UTF8STRING dimStyleName;          /*!< Dim-style name, code 3 */
+    dwgHandle dimStyleH;              /*!< Dimension-style handle, DWG hard pointer */
+    DRW_Coord insertionPoint;         /*!< Insertion point, codes 10/20/30 */
+    DRW_Coord xAxisDirectionVector;   /*!< X-axis direction in WCS, codes 11/21/31 */
+    DRW_Coord extPoint;               /*!< Extrusion direction, codes 210/220/230 */
+};
+
+//! Class to handle block entries
+/*!
+*  Class to handle block entries
+*  @author Rallaz
+*/
+class DRW_Block : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Block() {
+        eType = DRW::BLOCK;
+        layer = "0";
+        flags = 0;
+        name = "*U0";
+        isEnd = false;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING name;             /*!< block name, code 2 */
+    int flags;                   /*!< block type, code 70 */
+    int insUnits = 0;            /*!< block insertion units, BLOCK_RECORD code 70 */
+    UTF8STRING xrefPath;         /*!< Xref path name, code 1 (DXF) / copied from BLOCK_RECORD (DWG) */
+
+    /// Set externally before encodeDwg to emit an ENDBLK rather than a
+    /// BLOCK entity (suppresses the name field and uses oType=5).
+    void setIsEnd(bool e) { isEnd = e; }
+    bool getIsEnd() const { return isEnd; }
+private:
+    bool isEnd; //for dwg parsing
+};
+
+
+//! Class to handle insert entries
+/*!
+*  Class to handle insert entries
+*  @author Rallaz
+*/
+class DRW_Attrib;
+
+class DRW_Insert : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Insert() {
+        eType = DRW::INSERT;
+        xscale = 1;
+        yscale = 1;
+        zscale = 1;
+        angle = 0;
+        colcount = 1;
+        rowcount = 1;
+        colspace = 0;
+        rowspace = 0;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING name;         /*!< block name, code 2 */
+    double xscale;           /*!< x scale factor, code 41 */
+    double yscale;           /*!< y scale factor, code 42 */
+    double zscale;           /*!< z scale factor, code 43 */
+    double angle;            /*!< rotation angle in radians, code 50 */
+    int colcount;            /*!< column count, code 70 */
+    int rowcount;            /*!< row count, code 71 */
+    double colspace;         /*!< column space, code 44 */
+    double rowspace;         /*!< row space, code 45 */
+    [[nodiscard]] bool isMInsert() const noexcept {
+        return colcount > 1 || rowcount > 1;
+    }
+    /*!< Attached attribute entities, populated by DWG dispatcher when
+         ATTRIB entities owned by this INSERT are read. */
+    std::vector<std::shared_ptr<DRW_Attrib>> attlist;
+public: //only for read dwg
+    dwgHandle blockRecH;
+    dwgHandle seqendH; //RLZ: on implement attrib remove this handle from obj list (see pline/vertex code)
+    /*!< Handles of attached ATTRIBs, captured from DRW_Insert::parseDwg. */
+    std::vector<dwgHandle> attribHandles;
+};
+
+//! Minimal semantic payload for ACAD_TABLE / TABLECONTENT.
+struct DRW_TableCellContent {
+    int m_type = 0;          /*!< 1=value, 2=FIELD, 4=block */
+    UTF8STRING m_text;
+    DRW_CadValue m_value;
+    std::uint32_t m_handle = 0;
+};
+
+struct DRW_TableCellAttribute {
+    std::uint32_t m_attdefHandle = 0;
+    int m_index = 0;
+    UTF8STRING m_text;
+};
+
+struct DRW_TableBorder {
+    int m_lineWeight = 0;
+    bool m_visible = true;
+    int m_colorRgb = -1;
+    std::uint8_t m_colorMethod = 0;
+};
+
+struct DRW_TableCell {
+    int m_flags = 0;
+    int m_type = 0;
+    int m_edgeFlags = 0;
+    bool m_isMerged = false;
+    bool m_autoFit = false;
+    int m_mergedWidth = 0;
+    int m_mergedHeight = 0;
+    double m_rotation = 0.0;
+    UTF8STRING m_toolTip;
+    int m_styleId = 0;
+    int m_virtualEdgeFlags = 0;
+    std::uint32_t m_overrideFlags = 0;
+    std::uint32_t m_valueHandle = 0;
+    std::uint32_t m_textStyleHandle = 0;
+    std::uint32_t m_textStyleOverrideHandle = 0;
+    std::uint32_t m_blockHandle = 0;
+    double m_blockScale = 1.0;
+    double m_width = 0.0;
+    double m_height = 0.0;
+    std::uint32_t m_geometryFlags = 0;
+    std::uint32_t m_geometryHandle = 0;
+    std::uint32_t m_geometryRecordFlags = 0;
+    DRW_Coord m_geometryTopLeft;
+    DRW_Coord m_geometryCenter;
+    double m_contentWidth = 0.0;
+    double m_contentHeight = 0.0;
+    double m_geometryWidth = 0.0;
+    double m_geometryHeight = 0.0;
+    std::vector<DRW_TableCellAttribute> m_attributes;
+    std::vector<DRW_TableCellContent> m_contents;
+
+    int m_textColorRgb = -1;
+    std::uint8_t m_textColorMethod = 0;
+    int m_fillColorRgb = -1;
+    std::uint8_t m_fillColorMethod = 0;
+    bool m_backgroundEnabled = false;
+    int m_textAlignment = 0;
+    double m_textHeight = 0.0;
+
+    std::array<DRW_TableBorder, 6> m_borders;
+};
+
+struct DRW_TableColumn {
+    UTF8STRING m_name;
+    double m_width = 0.0;
+};
+
+struct DRW_TableRow {
+    double m_height = 0.0;
+    std::vector<DRW_TableCell> m_cells;
+};
+
+struct DRW_TableMergedRange {
+    int m_topRow = 0;
+    int m_leftColumn = 0;
+    int m_bottomRow = 0;
+    int m_rightColumn = 0;
+};
+
+struct DRW_TableContent {
+    UTF8STRING m_name;
+    UTF8STRING m_description;
+    std::vector<DRW_TableColumn> m_columns;
+    std::vector<DRW_TableRow> m_rows;
+    std::vector<std::uint32_t> m_fieldHandles;
+    std::vector<DRW_TableMergedRange> m_mergedRanges;
+    std::uint32_t m_tableStyleHandle = 0;
+    std::vector<DRW_DwgSubrecordRange> m_subrecordRanges;
+};
+
+//! Class to handle ACAD_TABLE (AcDbTable).
+class DRW_Table : public DRW_Insert {
+    SETENTFRIENDS
+public:
+    DRW_Table() {
+        eType = DRW::TABLE;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+
+public:
+    int m_valueFlag = 0;
+    DRW_Coord m_horizontalDirection;
+    bool m_hasSemanticContent = false;
+    bool m_semanticContentComplete = false;
+    std::uint32_t m_tableStyleHandle = 0;
+    DRW_TableContent m_content;
+
+private:
+    enum class DxfSubclass {
+        Entity,
+        BlockReference,
+        Table
+    };
+
+    DxfSubclass m_dxfSubclass = DxfSubclass::Entity;
+    int m_dxfRowsExpected = -1;
+    int m_dxfColumnsExpected = -1;
+    std::size_t m_dxfRowHeightsRead = 0;
+    std::size_t m_dxfColumnWidthsRead = 0;
+    std::size_t m_dxfNextCell = 0;
+    int m_dxfCurrentCell = -1;
+    bool m_dxfInCellValue = false;
+};
+
+//! Class to handle standalone TABLECONTENT (AcDbTableContent) objects.
+class DRW_TableContentObject : public DRW_TableEntry {
+    SETOBJFRIENDS
+public:
+    DRW_TableContentObject() { reset(); }
+    void reset(){
+        tType = DRW::TABLECONTENT;
+        m_content = DRW_TableContent();
+        m_parseComplete = false;
+        DRW_TableEntry::reset();
+    }
+protected:
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+public:
+    DRW_TableContent m_content;
+    bool m_parseComplete = false;
+};
+
+//! Class to handle lwpolyline entity
+/*!
+*  Class to handle lwpolyline entity
+*  @author Rallaz
+*/
+class DRW_LWPolyline : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_LWPolyline() {
+        eType = DRW::LWPOLYLINE;
+        elevation = thickness = width = 0.0;
+        flags = 0;
+        extPoint.x = extPoint.y = 0;
+		extPoint.z = 1;
+    }
+    
+    DRW_LWPolyline(const DRW_LWPolyline& p):DRW_Entity(p){
+        this->eType = DRW::LWPOLYLINE;
+        this->elevation = p.elevation;
+        this->thickness = p.thickness;
+        this->width = p.width;
+        this->flags = p.flags;
+		this->extPoint = p.extPoint;
+        this->vertexnum = p.vertexnum;
+        for (unsigned i=0; i<p.vertlist.size(); i++)// RLZ ok or new
+		  this->vertlist.push_back(
+					std::make_shared<DRW_Vertex2D>(*p.vertlist.at(i))
+					);
+        // Deep-copy the base extData too: the implicit DRW_Entity(p) base copy
+        // shallow-copies the shared_ptr XDATA variants, but parseAttribs mutates
+        // them, so two copies must not share. (`vertex` stays null in a fresh
+        // copy; `curr` is a private parse-transient cursor — its shallow copy is
+        // benign since reset() clears it before reuse.)
+        extData.clear();
+        for (const auto& v : p.extData)
+            extData.push_back(v ? std::make_shared<DRW_Variant>(*v) : nullptr);
+    }
+    // Deep-copy assignment to match the deep-copy constructor; the implicit
+    // operator= would shallow-copy the shared_ptr vertlist, so two assigned
+    // polylines would alias (and mutate) each other's vertices (Rule of 3).
+    DRW_LWPolyline& operator=(const DRW_LWPolyline& p) {
+        if (this != &p) {
+            DRW_Entity::operator=(p);
+            eType = DRW::LWPOLYLINE;
+            elevation = p.elevation;
+            thickness = p.thickness;
+            width = p.width;
+            flags = p.flags;
+            extPoint = p.extPoint;
+            vertexnum = p.vertexnum;
+            vertlist.clear();
+            for (const auto& v : p.vertlist)
+                vertlist.push_back(std::make_shared<DRW_Vertex2D>(*v));
+            vertex.reset();  // transient build pointer — do not alias p's vertlist
+            // Deep-copy base extData (DRW_Entity::operator= aliased the shared
+            // XDATA variants, which parseAttribs mutates).
+            extData.clear();
+            for (const auto& v : p.extData)
+                extData.push_back(v ? std::make_shared<DRW_Variant>(*v) : nullptr);
+        }
+        return *this;
+    }
+
+    virtual void applyExtrusion() override;
+    void addVertex (DRW_Vertex2D v) {
+		std::shared_ptr<DRW_Vertex2D> vert = std::make_shared<DRW_Vertex2D>(v);
+        vertlist.push_back(vert);
+    }
+	std::shared_ptr<DRW_Vertex2D> addVertex () {
+		std::shared_ptr<DRW_Vertex2D> vert = std::make_shared<DRW_Vertex2D>();
+        vert->stawidth = 0;
+        vert->endwidth = 0;
+        vert->bulge = 0;
+        vertlist.push_back(vert);
+        return vert;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version v, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    int vertexnum = 0;        /*!< number of vertex, code 90 */
+    int flags;                /*!< polyline flag, code 70, default 0 */
+    double width;             /*!< constant width, code 43 */
+    double elevation;         /*!< elevation, code 38 */
+    double thickness;         /*!< thickness, code 39 */
+    DRW_Coord extPoint;       /*!<  Dir extrusion normal vector, code 210, 220 & 230 */
+	std::shared_ptr<DRW_Vertex2D> vertex;       /*!< current vertex to add data */
+	std::vector<std::shared_ptr<DRW_Vertex2D>> vertlist;  /*!< vertex list */
+};
+
+//! One MLINE vertex carries a baseline point plus per-line segment params.
+struct DRW_MLineVertex {
+    DRW_Coord position;       /*!< 3BD — centerline (baseline) vertex */
+    DRW_Coord vertexDir;      /*!< 3BD — direction along baseline at this vertex */
+    DRW_Coord miterDir;       /*!< 3BD — perpendicular for offset (per-vertex) */
+    /*!< Per parallel line in style: list of segment parameters (DXF code 41) */
+    std::vector<std::vector<double>> segParms;
+    /*!< Per parallel line: list of area-fill parameters (DXF code 42) */
+    std::vector<std::vector<double>> areaFillParms;
+};
+
+//! Class to handle MLINE entity (ODA spec §19.4.78, fixed type 0x2F = 47).
+/*!
+ *  Multiline: N parallel lines defined by an MLINESTYLE, with shared
+ *  baseline vertex array. LibreCAD has no native multiline; the DXF
+ *  filter decomposes each MLINE into N RS_Polyline children carrying
+ *  XDATA round-trip metadata. See plan §"Round-trip schema".
+ */
+class DRW_MLine : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_MLine() {
+        eType = DRW::MLINE;
+        scale = 1.0;
+        justification = 0;
+        openClosed = 1;
+        numLines = 0;
+        numVerts = 0;
+        styleHandle = 0;
+        m_currentVertexIdx = -1;
+        m_currentElementIdx = 0;
+        m_currentSegFillCount = 0;
+    }
+    void applyExtrusion() override {}
+protected:
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+public:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    double scale;                  /*!< BD / DXF 40 */
+    std::uint8_t justification;          /*!< RC / DXF 70 — 0=top, 1=zero, 2=bottom */
+    DRW_Coord basePoint;           /*!< 3BD / DXF 10 20 30 */
+    DRW_Coord extPoint{0,0,1};     /*!< BE / DXF 210 220 230 */
+    int openClosed;                /*!< BS / DXF 71 — bit 0 closed */
+    std::uint8_t numLines;               /*!< RC / DXF 73 — element count */
+    std::uint16_t numVerts;              /*!< BS / DXF 72 */
+    UTF8STRING styleName;          /*!< DXF code 2 — resolved from styleHandle */
+    std::uint32_t styleHandle;           /*!< H / DXF 340 */
+    std::vector<DRW_MLineVertex> vertlist;
+private:
+    // Transient state for DXF parseCode multi-vertex/multi-element walk.
+    int m_currentVertexIdx;
+    int m_currentElementIdx;
+    int m_currentSegFillCount;
+};
+
+//! Class to handle UNDERLAY entity (PDFUNDERLAY/DGNUNDERLAY/DWFUNDERLAY).
+/*!
+ *  Three flavors share one class: PDF, DGN, DWF. References an external
+ *  file via definitionHandle. LibreCAD has no PDF/DGN/DWF rendering;
+ *  the filter decomposes each underlay into a single RS_Polyline showing
+ *  the clip boundary as a placeholder.
+ */
+class DRW_Underlay : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    enum Kind { PDF, DGN, DWF };
+    static constexpr std::uint16_t kDwgClassNumPdf = 523;
+    static constexpr std::uint16_t kDwgClassNumDgn = 524;
+    static constexpr std::uint16_t kDwgClassNumDwf = 525;
+    DRW_Underlay() {
+        eType = DRW::UNDERLAY;
+        scale = DRW_Coord(1.0, 1.0, 1.0);
+        m_currentClipVertexIdx = -1;
+    }
+    void applyExtrusion() override {}
+protected:
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr,
+                   dwgBufferW *handleBuf=nullptr) override;
+public:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+public:
+    Kind kind = PDF;
+    DRW_Coord position;
+    DRW_Coord scale{1,1,1};
+    double rotation = 0.0;          /*!< BD radians (DWG) / DXF 50 degrees */
+    DRW_Coord extPoint{0,0,1};
+    std::uint8_t flags = 2;               /*!< RC / DXF 280 — default 2 = visible */
+    std::uint8_t contrast = 100;          /*!< RC / DXF 281 (0..100) */
+    std::uint8_t fade = 0;                /*!< RC / DXF 282 (0..100) */
+    std::uint32_t definitionHandle = 0;   /*!< H / DXF 340 */
+    std::vector<DRW_Coord> clipBoundary;  /*!< 2D clip in OCS */
+private:
+    int m_currentClipVertexIdx;
+};
+
+//! Class to handle insert entries
+/*!
+*  Class to handle insert entries
+*  @author Rallaz
+*/
+class DRW_Text : public DRW_Line {
+    SETENTFRIENDS
+public:
+    //! Vertical alignments.
+        enum VAlign {
+            VBaseLine = 0,  /*!< Top = 0 */
+            VBottom,        /*!< Bottom = 1 */
+            VMiddle,        /*!< Middle = 2 */
+            VTop            /*!< Top = 3 */
+        };
+
+    //! Horizontal alignments.
+        enum HAlign {
+            HLeft = 0,     /*!< Left = 0 */
+            HCenter,       /*!< Centered = 1 */
+            HRight,        /*!< Right = 2 */
+            HAligned,      /*!< Aligned = 3 (if VAlign==0) */
+            HMiddle,       /*!< middle = 4 (if VAlign==0) */
+            HFit           /*!< fit into point = 5 (if VAlign==0) */
+        };
+
+    DRW_Text() {
+        eType = DRW::TEXT;
+        angle = 0;
+        widthscale = 1;
+        oblique = 0;
+        style = "STANDARD";
+        textgen = 0;
+        alignH = HLeft;
+        alignV = VBaseLine;
+    }
+
+    virtual void applyExtrusion() override {} //RLZ TODO
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double height = 0.0;       /*!< height text, code 40 */
+    UTF8STRING text;           /*!< text string, code 1 */
+    double angle;              /*!< rotation angle in degrees (360), code 50 */
+    double widthscale;         /*!< width factor, code 41 */
+    double oblique;            /*!< oblique angle, code 51 */
+    UTF8STRING style;          /*!< style name, code 7 */
+    int textgen;               /*!< text generation, code 71 */
+    enum HAlign alignH;        /*!< horizontal align, code 72 */
+    enum VAlign alignV;        /*!< vertical align, code 73 */
+    dwgHandle styleH;          /*!< handle for text style */
+};
+
+//! Class to handle ATTRIB entities (block attribute instance).
+/*!
+*  ATTRIB derives from TEXT in both DXF and DWG formats. It carries the
+*  attribute tag plus a flags byte (group 70: 1=invisible, 2=constant,
+*  4=verify, 8=preset). In DWG, ATTRIBs follow their owning INSERT and
+*  are routed to DRW_Insert::attlist by the dispatcher.
+*/
+class DRW_Attrib : public DRW_Text {
+    SETENTFRIENDS
+public:
+    DRW_Attrib() {
+        eType = DRW::ATTRIB;
+        attribFlags = 0;
+        lockPosition = false;
+        attVersion = 0;
+        m_attributeType = 1;
+    }
+    // Out-of-line so unique_ptr<DRW_MText> works with the forward declaration
+    // (the DRW_MText destructor must be visible at the call site).
+    ~DRW_Attrib() override;
+    DRW_Attrib(const DRW_Attrib&);
+    DRW_Attrib& operator=(const DRW_Attrib&);
+    DRW_Attrib(DRW_Attrib&&) noexcept;
+    DRW_Attrib& operator=(DRW_Attrib&&) noexcept;
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING tag;            /*!< attribute tag, code 2 */
+    std::uint8_t attribFlags;        /*!< attribute flags, code 70 (1=invisible, 2=constant, 4=verify, 8=preset) */
+    int m_fieldLength = 0;   /*!< field length (obsolete), DXF code 73 in AcDbAttribute; DWG fieldLen BS */
+    bool lockPosition;         /*!< lock position flag (R2010+) */
+    std::uint8_t attVersion;         /*!< version byte (R2010+); 0=plain TEXT-style, >0=MText-style */
+    std::uint8_t m_attributeType;    /*!< R2018+ attribute type: 1=single-line, 2=multi-line ATTRIB, 4=multi-line ATTDEF */
+    /* MText-style payload (R2010+).  Non-null iff attVersion > 0 (DWG) or the
+       AcDbMText nested subclass was seen (DXF).  Carries the multi-line text
+       and formatting (paragraph breaks, font runs, etc.) that the single-line
+       `text` field can't represent. */
+    std::unique_ptr<DRW_MText> mtext;
+};
+
+//! Class to handle ATTDEF entities (block attribute definition).
+/*!
+*  ATTDEF extends ATTRIB with a prompt string. Lives in BLOCK definitions
+*  as a template; the corresponding ATTRIB instance carries the runtime
+*  value.
+*/
+class DRW_Attdef : public DRW_Attrib {
+    SETENTFRIENDS
+public:
+    DRW_Attdef() {
+        eType = DRW::ATTDEF;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING prompt;         /*!< prompt string, code 3 */
+};
+
+//! Class to handle insert entries
+/*!
+*  Class to handle insert entries
+*  @author Rallaz
+*/
+class DRW_MText : public DRW_Text {
+    SETENTFRIENDS
+    // ATTRIB / ATTDEF embed a DRW_MText for the AcDbMText nested subclass; let
+    // them route DXF group codes via the protected parseCode().
+    friend class DRW_Attrib;
+    friend class DRW_Attdef;
+public:
+    //! Attachments.
+    enum Attach {
+        TopLeft = 1,
+        TopCenter,
+        TopRight,
+        MiddleLeft,
+        MiddleCenter,
+        MiddleRight,
+        BottomLeft,
+        BottomCenter,
+        BottomRight
+    };
+
+    DRW_MText() {
+        eType = DRW::MTEXT;
+        interlin = 1;
+        alignV = (VAlign)TopLeft;
+        textgen = 1;
+        hasXAxisVec = false; // if true need to calculate angle from secPoint vector
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    void updateAngle();    // recalculate angle if 'hasXAxisVec' is true
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double interlin;              /*!< linespacing factor, code 44 */
+    std::uint16_t linespacingStyle = 1; /*!< linespacing style, code 73 (1=at least, 2=exact) */
+    std::int32_t m_backgroundFlags = 0;
+    double m_backgroundScale = 0.0; /*!< background-fill box scale (DWG BitDouble) */
+    int m_backgroundColor = 0;
+    std::int32_t m_backgroundTransparency = 0;
+    bool m_r2018IsNotAnnotative = false;
+    std::uint16_t m_r2018Version = 0;
+    bool m_r2018DefaultFlag = false;
+    std::uint32_t m_r2018AppIdHandle = 0;
+    std::int32_t m_r2018Attachment = 0;
+    DRW_Coord m_r2018XAxisDir;
+    DRW_Coord m_r2018InsertionPoint;
+    double m_r2018RectWidth = 0.0;
+    double m_r2018RectHeight = 0.0;
+    double m_r2018ExtentsHeight = 0.0;
+    double m_r2018ExtentsWidth = 0.0;
+    std::uint16_t m_r2018ColumnType = 0;
+    std::int32_t m_r2018ColumnCount = 0;
+    double m_r2018ColumnWidth = 0.0;
+    double m_r2018ColumnGutter = 0.0;
+    bool m_r2018ColumnAutoHeight = false;
+    bool m_r2018ColumnFlowReversed = false;
+    std::vector<double> m_r2018ColumnHeights;
+private:
+    bool hasXAxisVec; /* renamed by djm for better description */
+};
+
+//! Class to handle RTEXT (RText, AutoCAD Express Tools "reactive text").
+/*!
+*  RTEXT renders text generated at view time from a DIESEL expression (or an
+*  xref path).  libdxfrw has no RText-specific model; the entity is mapped onto
+*  DRW_Text (single-line) so it renders — the literal text if present, else the
+*  raw DIESEL/xref string rides on DRW_Text::text.  Delivered via addText.
+*  DWG type 1159 / AcDbRText; field order per the read-only dwg-ts reference
+*  decoder (insertion 3BD, extrusion 3BD, rotation BD, height BD, flags BS,
+*  text TV, then the style handle).
+*/
+class DRW_RText : public DRW_Text {
+    SETENTFRIENDS
+public:
+    static constexpr std::uint16_t kDwgClassNum = 521;
+    DRW_RText() {
+        eType = DRW::TEXT;
+        m_rTextFlags = 0;
+    }
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+public:
+    int m_rTextFlags;   /*!< RTEXT flags, code 70 (bit 0: DIESEL vs xref path) */
+};
+
+//! Class to handle ARCALIGNEDTEXT (AcDbArcAlignedText, Express Tools arc text).
+/*!
+*  Arc-aligned text is a legacy Express Tools entity whose glyphs follow an arc.
+*  libdxfrw has no arc-text model; it is mapped onto DRW_Text (delivered via
+*  addText) as a 2D approximation — applyArcApproximation() places the text at
+*  the arc mid-point with the baseline tangent to the arc.  The full arc/text
+*  parameters are retained on the object.  DWG type 1163; field order per the
+*  read-only dwg-ts reference decoder (ten TV strings, then center 3BD, radius
+*  BD, start/end angle BD, extrusion 3BD, colour BL, eleven BS flags, arc H).
+*/
+class DRW_ArcAlignedText : public DRW_Text {
+    SETENTFRIENDS
+public:
+    static constexpr std::uint16_t kDwgClassNum = 522;
+    DRW_ArcAlignedText() {
+        eType = DRW::TEXT;
+        m_radius = 0.0;
+        m_startAngle = 0.0;
+        m_endAngle = 0.0;
+        m_rawColor = 0;
+        m_characterSet = 0;
+        m_pitchAndFamily = 0;
+        m_isShx = 0;
+        m_isBold = 0;
+        m_isItalic = 0;
+        m_isUnderlined = 0;
+        m_alignment = 0;
+        m_isReverse = 0;
+        m_wizardFlag = 0;
+        m_textPosition = 0;
+        m_textDirection = 0;
+        m_arcHandle = 0;
+    }
+    //! Place the text at the arc mid-point with a tangent baseline (2D approx),
+    //! deriving DRW_Text::basePoint / angle / height from the arc parameters.
+    void applyArcApproximation();
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+public:
+    DRW_Coord m_center;          /*!< arc center, code 10/20/30 */
+    double m_radius;             /*!< arc radius, code 40 */
+    double m_startAngle;         /*!< start angle in radians, code 50 (DXF degrees) */
+    double m_endAngle;           /*!< end angle in radians, code 51 (DXF degrees) */
+    UTF8STRING m_textSize;       /*!< text size (D2T string), code 42 */
+    UTF8STRING m_xScale;         /*!< width factor (D2T), code 41 */
+    UTF8STRING m_charSpacing;    /*!< character spacing (D2T), code 43 */
+    UTF8STRING m_offsetFromArc;  /*!< offset from arc (D2T), code 44 */
+    UTF8STRING m_rightOffset;    /*!< right offset (D2T), code 45 */
+    UTF8STRING m_leftOffset;     /*!< left offset (D2T), code 46 */
+    UTF8STRING m_fontName;       /*!< font name, code 2 */
+    UTF8STRING m_bigFontName;    /*!< big-font name, code 3 */
+    int m_rawColor;              /*!< raw color, code 90 */
+    int m_characterSet;          /*!< code 77 */
+    int m_pitchAndFamily;        /*!< code 78 */
+    int m_isShx;                 /*!< code 79 */
+    int m_isBold;                /*!< code 74 */
+    int m_isItalic;              /*!< code 75 */
+    int m_isUnderlined;          /*!< code 76 */
+    int m_alignment;             /*!< code 72 */
+    int m_isReverse;             /*!< code 70 */
+    int m_wizardFlag;            /*!< code 280 */
+    int m_textPosition;          /*!< code 73 */
+    int m_textDirection;         /*!< code 71 */
+    std::uint32_t m_arcHandle;   /*!< handle of the followed arc, code 330 */
+};
+
+//! Class to handle vertex
+/*!
+*  Class to handle vertex  for polyline entity
+*  @author Rallaz
+*/
+class DRW_Vertex : public DRW_Point {
+    SETENTFRIENDS
+public:
+    enum class DwgSubtype {
+        Auto,
+        Vertex2D,
+        Vertex3D,
+        Mesh,
+        Polyface,
+        PolyfaceFace
+    };
+
+    DRW_Vertex() {
+        eType = DRW::VERTEX;
+        stawidth = endwidth = bulge = 0;
+        vindex1 = vindex2 = vindex3 = vindex4 = 0;
+        flags = identifier = 0;
+        m_dwgSubtype = DwgSubtype::Auto;
+    }
+    DRW_Vertex(double sx, double sy, double sz, double b) {
+        stawidth = endwidth = 0;
+        vindex1 = vindex2 = vindex3 = vindex4 = 0;
+        flags = identifier = 0;
+        m_dwgSubtype = DwgSubtype::Auto;
+        basePoint.x = sx;
+        basePoint.y =sy;
+        basePoint.z =sz;
+        bulge = b;
+    }
+    void setDwgSubtype(DwgSubtype subtype) { m_dwgSubtype = subtype; }
+    DwgSubtype dwgSubtype() const { return m_dwgSubtype; }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    using DRW_Point::parseDwg;
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0, double el=0);
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double stawidth;          /*!< Start width, code 40 */
+    double endwidth;          /*!< End width, code 41 */
+    double bulge;             /*!< bulge, code 42 */
+
+    int flags;                 /*!< vertex flag, code 70, default 0 */
+    double tgdir = 0.0;     /*!< curve fit tangent direction, code 50 */
+    int vindex1;             /*!< polyface mesh vertex index, code 71, default 0 */
+    int vindex2;             /*!< polyface mesh vertex index, code 72, default 0 */
+    int vindex3;             /*!< polyface mesh vertex index, code 73, default 0 */
+    int vindex4;             /*!< polyface mesh vertex index, code 74, default 0 */
+    int identifier;           /*!< vertex identifier, code 91, default 0 */
+private:
+    DwgSubtype m_dwgSubtype {DwgSubtype::Auto};
+};
+
+//! DWG-only SEQEND terminator used by POLYLINE/INSERT owned chains.
+class DRW_SeqEnd : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_SeqEnd() {
+        eType = DRW::SEQEND;
+    }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                   dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle polyline entity
+/*!
+*  Class to handle polyline entity
+*  @author Rallaz
+*/
+class DRW_Polyline : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Polyline() {
+        eType = DRW::POLYLINE;
+        defstawidth = defendwidth = 0.0;
+        basePoint.x = basePoint.y = 0.0;
+        flags = vertexcount = facecount = 0;
+        smoothM = smoothN = curvetype = 0;
+    }
+    void addVertex (DRW_Vertex v) {
+        std::shared_ptr<DRW_Vertex> vert = std::make_shared<DRW_Vertex>();
+        vert->basePoint.x = v.basePoint.x;
+        vert->basePoint.y = v.basePoint.y;
+        vert->basePoint.z = v.basePoint.z;
+        vert->stawidth = v.stawidth;
+        vert->endwidth = v.endwidth;
+        vert->bulge = v.bulge;
+        vert->flags = v.flags;
+        vert->tgdir = v.tgdir;
+        vert->vindex1 = v.vindex1;
+        vert->vindex2 = v.vindex2;
+        vert->vindex3 = v.vindex3;
+        vert->vindex4 = v.vindex4;
+        vert->identifier = v.identifier;
+        vert->setDwgSubtype(v.dwgSubtype());
+        vertlist.push_back(vert);
+    }
+    void appendVertex (std::shared_ptr<DRW_Vertex> const& v) {
+        vertlist.push_back(v);
+    }
+    void setDwgSeqEndHandle(std::uint32_t ref) {
+        seqEndH.code = ref == 0 ? 0 : 5;
+        seqEndH.ref = ref;
+        seqEndH.size = 0;
+        for (std::uint32_t t = ref; t != 0; t >>= 8)
+            ++seqEndH.size;
+    }
+    std::uint32_t dwgSeqEndHandle() const { return seqEndH.ref; }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    int flags;               /*!< polyline flag, code 70, default 0 */
+    double defstawidth;      /*!< Start width, code 40, default 0 */
+    double defendwidth;      /*!< End width, code 41, default 0 */
+    int vertexcount;         /*!< polygon mesh M vertex or  polyface vertex num, code 71, default 0 */
+    int facecount;           /*!< polygon mesh N vertex or  polyface face num, code 72, default 0 */
+    int smoothM;             /*!< smooth surface M density, code 73, default 0 */
+    int smoothN;             /*!< smooth surface M density, code 74, default 0 */
+    int curvetype;           /*!< curves & smooth surface type, code 75, default 0 */
+
+    std::vector<std::shared_ptr<DRW_Vertex>> vertlist;  /*!< vertex list */
+
+private:
+    std::list<std::uint32_t>hadlesList; //list of handles, only in 2004+
+    std::uint32_t firstEH = 0;  //handle of first entity, only in pre-2004
+    std::uint32_t lastEH = 0;   //handle of last entity, only in pre-2004
+    dwgHandle seqEndH;    //handle of SEQEND entity
+};
+
+
+//! Class to handle spline entity
+/*!
+*  Class to handle spline entity
+*  @author Rallaz
+*/
+class DRW_Spline : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Spline() {
+        eType = DRW::SPLINE;
+        flags = nknots = ncontrol = nfit = 0;
+        m_scenario = 0;
+        m_splineFlags1 = 0;
+        m_knotParam = 15;
+        tolknot = tolcontrol = tolfit = 0.0000001;
+
+    }
+    virtual void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+    // Spline payload (scenario/degree/knots/ctrl/fit) WITHOUT the leading
+    // common-entity parse or the trailing entity-handle data.  Shared with
+    // DRW_Helix, whose AcDbHelix trailer follows the spline body (Phase 8a-1).
+    bool parseDwgSplineBody(DRW::Version version, dwgBuffer *buf);
+    void encodeDwgSplineBody(DRW::Version version, dwgBufferW *buf) const;
+
+public:
+//    double ex;                /*!< normal vector x coordinate, code 210 */
+//    double ey;                /*!< normal vector y coordinate, code 220 */
+//    double ez;                /*!< normal vector z coordinate, code 230 */
+    DRW_Coord normalVec;      /*!< normal vector, code 210, 220, 230 */
+    DRW_Coord tgStart;        /*!< start tangent, code 12, 22, 32 */
+//    double tgsx;              /*!< start tangent x coordinate, code 12 */
+//    double tgsy;              /*!< start tangent y coordinate, code 22 */
+//    double tgsz;              /*!< start tangent z coordinate, code 32 */
+    DRW_Coord tgEnd;          /*!< end tangent, code 13, 23, 33 */
+//    double tgex;              /*!< end tangent x coordinate, code 13 */
+//    double tgey;              /*!< end tangent y coordinate, code 23 */
+//    double tgez;              /*!< end tangent z coordinate, code 33 */
+    int flags;                /*!< spline flag, code 70 */
+    int degree = 0;           /*!< degree of the spline, code 71 */
+    std::int32_t m_scenario;         /*!< DWG spline scenario: 1=control points, 2=fit points */
+    std::int32_t m_splineFlags1;     /*!< R2013+ method/closed/knot-parameter flags */
+    std::int32_t m_knotParam;        /*!< R2013+ knot parameterization selector */
+    std::int32_t nknots;            /*!< number of knots, code 72, default 0 */
+    std::int32_t ncontrol;          /*!< number of control points, code 73, default 0 */
+    std::int32_t nfit;              /*!< number of fit points, code 74, default 0 */
+    double tolknot;           /*!< knot tolerance, code 42, default 0.0000001 */
+    double tolcontrol;        /*!< control point tolerance, code 43, default 0.0000001 */
+    double tolfit;            /*!< fit point tolerance, code 44, default 0.0000001 */
+
+    std::vector<double> knotslist;           /*!< knots list, code 40 */
+    std::vector<double> weightlist;          /*!< weight list, code 41 */
+    std::vector<std::shared_ptr<DRW_Coord>> controllist;  /*!< control points list, code 10, 20 & 30 */
+    std::vector<std::shared_ptr<DRW_Coord>> fitlist;      /*!< fit points list, code 11, 21 & 31 */
+
+private:
+    std::shared_ptr<DRW_Coord> controlpoint;   /*!< current control point to add data */
+    std::shared_ptr<DRW_Coord> fitpoint;       /*!< current fit point to add data */
+};
+
+//! Class to handle helix entity (AcDbHelix, custom class 503)
+/*!
+*  A HELIX is encoded as a SPLINE body plus an AcDbHelix trailer carrying the
+*  generating axis/turns metadata.  LibreCAD has no native helix entity, so on
+*  import it is delegated to addSpline (the spline approximation); the trailer
+*  fields are preserved on the DWG round-trip but dropped on the RS mapping.
+*/
+class DRW_Helix : public DRW_Spline {
+    SETENTFRIENDS
+public:
+    DRW_Helix() {
+        eType = DRW::HELIX;
+    }
+    static constexpr std::uint16_t kDwgClassNum = 503; /*!< AcDbHelix DWG custom class id */
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    std::int32_t m_majorVersion = 0;   /*!< AcDbHelix major version, code 90 */
+    std::int32_t m_maintVersion = 0;   /*!< AcDbHelix maintenance version, code 91 */
+    DRW_Coord axisBasePt;        /*!< axis base point, code 10/20/30 */
+    DRW_Coord startPt;           /*!< start point, code 11/21/31 */
+    DRW_Coord axisVector;        /*!< axis vector, code 12/22/32 */
+    double radius = 0.0;         /*!< radius, code 40 */
+    double turns = 0.0;          /*!< number of turns, code 41 */
+    double turnHeight = 0.0;     /*!< turn height, code 42 */
+    bool handedness = false;     /*!< 0 = left-handed, 1 = right-handed, code 290 */
+    std::uint8_t constraintType = 0;   /*!< constrain type, code 280 */
+
+private:
+    bool m_parsingHelixSubclass = false;
+};
+
+//! Class to handle hatch loop
+/*!
+*  Class to handle hatch loop
+*  @author Rallaz
+*/
+class DRW_HatchLoop {
+public:
+    DRW_HatchLoop(int t) {
+        type = t;
+        numedges = 0;
+    }
+
+    void update() {
+        numedges = objlist.size();
+    }
+
+public:
+    int type;               /*!< boundary path type, code 92, polyline=2, default=0 */
+    int numedges;           /*!< number of edges (if not a polyline), code 93 */
+//TODO: store lwpolylines as entities
+//    std::vector<DRW_LWPolyline *> pollist;  /*!< polyline list */
+    std::vector<std::shared_ptr<DRW_Entity>> objlist;      /*!< entities list */
+    /* Source boundary object handles: count in DXF code 97 (per-loop),
+       then one code-330 handle per entry.  Empty when not associative. */
+    std::vector<std::uint32_t> m_boundaryHandles;
+};
+
+//! Class to handle hatch entity
+/*!
+*  Class to handle hatch entity
+*  @author Rallaz
+*/
+//TODO: handle lwpolylines, splines and ellipses
+class DRW_Hatch : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Hatch() {
+        eType = DRW::HATCH;
+        angle = scale = 0.0;
+        basePoint.x = basePoint.y = basePoint.z = 0.0;
+        loopsnum = hstyle = associative = 0;
+        solid = hpattern = 1;
+        deflines = doubleflag = 0;
+        clearEntities();
+    }
+
+    /*!
+     * One pattern definition line (group 53/43/44/45/46/79/49).
+     * Present only for non-solid hatches with explicit pattern data.
+     */
+    struct PatternLine {
+        double angle   {0.0};   /*!< line angle, code 53 */
+        double baseX   {0.0};   /*!< base point x, code 43 */
+        double baseY   {0.0};   /*!< base point y, code 44 */
+        double offsetX {0.0};   /*!< offset x, code 45 */
+        double offsetY {0.0};   /*!< offset y, code 46 */
+        std::vector<double> dashList; /*!< dash/space lengths, codes 49 (count = code 79) */
+    };
+
+    /*!
+     * Per-stop gradient color entry. Populated when isGradient != 0.
+     * 'value' is the position (group 463), 'rgb' is 24-bit color
+     * (group 421); 'aciColor' (group 63) is preserved when present.
+     */
+    struct GradientStop {
+        double  value {0.0};
+        int     rgb {-1};
+        int     aciColor {0};
+        std::uint8_t colorMethod {0};
+        UTF8STRING colorName;
+        UTF8STRING colorBookName;
+    };
+
+    void appendLoop (std::shared_ptr<DRW_HatchLoop> const& v) {
+        looplist.push_back(v);
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+    // Shared DWG boundary-loop reader (loop count + per-loop path/edge/polyline
+    // data). Extracted so DRW_MPolygon::parseDwg reuses the identical loop body
+    // while supplying its own differing leading/trailing field order.
+    bool parseDwgBoundaryData(DRW::Version version, dwgBuffer *buf,
+                              std::uint32_t &totalBoundItems, bool &havePixelSize);
+    void encodeDwgGradientData(DRW::Version version, dwgBufferW *buf,
+                               dwgBufferW *strBuf) const;
+    bool encodeDwgBoundaryData(DRW::Version version, dwgBufferW *buf) const;
+
+public:
+    UTF8STRING name;           /*!< hatch pattern name, code 2 */
+    int solid;                 /*!< solid fill flag, code 70, solid=1, pattern=0 */
+    int associative;           /*!< associativity, code 71, associatve=1, non-assoc.=0 */
+    int hstyle;                /*!< hatch style, code 75 */
+    int hpattern;              /*!< hatch pattern type, code 76 */
+    int doubleflag;            /*!< hatch pattern double flag, code 77, double=1, single=0 */
+    int loopsnum;              /*!< namber of boundary paths (loops), code 91 */
+    double angle;              /*!< hatch pattern angle, code 52 */
+    double scale;              /*!< hatch pattern scale, code 41 */
+    int deflines;              /*!< number of pattern definition lines, code 78 */
+    double pixelSize {0.0};   /*!< pixel size, code 47 */
+    std::vector<PatternLine> patternLines; /*!< pattern definition lines, count = deflines */
+
+    std::vector<std::shared_ptr<DRW_HatchLoop>> looplist;  /*!< polyline list */
+
+    /* Gradient (R2004+; DXF group codes 450..470, 421/63 per stop). */
+    int    isGradient {0};     /*!< 0 = solid/pattern hatch, 1 = gradient fill, code 450 */
+    int    gradReserved {0};   /*!< reserved gradient field, code 451 */
+    double gradAngle {0.0};    /*!< gradient angle in radians, code 460 */
+    double gradShift {0.0};    /*!< gradient shift (centered=0), code 461 */
+    int    singleColor {0};    /*!< 1 = single-color gradient + tint, code 452 */
+    double gradTint {0.0};     /*!< single-color tint, code 462 */
+    UTF8STRING gradName;       /*!< gradient pattern name, code 470 (e.g. "LINEAR") */
+    std::vector<GradientStop> gradColors; /*!< per-stop colors, count = code 453 */
+
+    /* Seed points (DXF code 98 = count, then 10/20 pairs). */
+    std::vector<DRW_Coord> seedPoints;
+
+private:
+    void clearEntities(){
+        pt.reset();
+        line.reset();
+        pline.reset();
+        arc.reset();
+        ellipse.reset();
+        spline.reset();
+        plvert.reset();
+        m_splineNfitSet = false;
+    }
+
+    void addLine() {
+        clearEntities();
+        if (loop) {
+            pt = line = std::make_shared<DRW_Line>();
+            loop->objlist.push_back(line);
+        }
+    }
+
+    void addArc() {
+        clearEntities();
+        if (loop) {
+            pt = arc = std::make_shared<DRW_Arc>();
+            loop->objlist.push_back(arc);
+        }
+    }
+
+    void addEllipse() {
+        clearEntities();
+        if (loop) {
+            pt = ellipse = std::make_shared<DRW_Ellipse>();
+            loop->objlist.push_back(ellipse);
+        }
+    }
+
+    void addSpline() {
+        clearEntities();
+        if (loop) {
+            pt.reset();
+            spline = std::make_shared<DRW_Spline>();
+            loop->objlist.push_back(spline);
+        }
+    }
+
+    std::shared_ptr<DRW_HatchLoop> loop;       /*!< current loop to add data */
+    std::shared_ptr<DRW_Line> line;
+    std::shared_ptr<DRW_Arc> arc;
+    std::shared_ptr<DRW_Ellipse> ellipse;
+    std::shared_ptr<DRW_Spline> spline;
+    std::shared_ptr<DRW_LWPolyline> pline;
+    std::shared_ptr<DRW_Point> pt;
+    std::shared_ptr<DRW_Vertex2D> plvert;
+    bool ispol;
+    /* True after the first code-97 in the current spline edge (= nfit set);
+       the second code-97 while spline is active is the per-loop boundary
+       handle count, not another nfit.  Reset by clearEntities(). */
+    bool m_splineNfitSet = false;
+    /* Remaining code-330 values to consume as boundary source handles.
+       Set when code-97 is interpreted as the per-loop boundary count. */
+    int m_boundaryHandleCount = 0;
+};
+
+//! Class to handle MPOLYGON (AcDbMPolygon) entity.
+/*!
+*  AcDbMPolygon is a hatch-derived filled polygon used mainly by AutoCAD Map 3D /
+*  Civil. Its boundary loops, solid flag and pattern share HATCH's representation,
+*  so it stores into a DRW_Hatch and renders through the existing addHatch path.
+*  It only adds a trailing fill-color, an x-direction vector and a degenerate-path
+*  count that plain HATCH does not carry. The DWG binary layout also differs from
+*  HATCH: a leading BS style field precedes the gradient block, and the trailing
+*  fields are a fill CMC + x-direction + degenerate-path count (not HATCH's pixel
+*  size + seed points). Both the DXF (dxfRW::processMPolygon) and DWG
+*  (DRW_MPolygon::parseDwg, routed by classesmap recName "MPOLYGON" / className
+*  "AcDbMPolygon") read paths are wired; both deliver via addMPolygon.
+*/
+class DRW_MPolygon : public DRW_Hatch {
+    SETENTFRIENDS
+public:
+    DRW_MPolygon() {
+        eType = DRW::MPOLYGON;
+    }
+
+    static constexpr std::uint16_t kDwgClassNum = 518; /*!< AcDbMPolygon DWG custom class id */
+
+    /* MPOLYGON-only fill color (DXF 63 ACI / 421 RGB / 430 name). Distinct from
+       the entity color: the fill may differ from the boundary outline color. */
+    int fillColorAci {0};      /*!< fill color ACI index, code 63 */
+    int fillColorRgb {-1};     /*!< fill color 24-bit RGB, code 421 (-1 = unset) */
+    UTF8STRING fillColorName;  /*!< fill color book/name, code 430 */
+    double xDirX {0.0};        /*!< boundary x-direction vector x, code 11 */
+    double xDirY {0.0};        /*!< boundary x-direction vector y, code 21 */
+    int degenerateLoops {0};   /*!< count of degenerate boundary paths, code 99 */
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle image entity
+/*!
+*  Class to handle image entity
+*  @author Rallaz
+*/
+class DRW_Image : public DRW_Line {
+    SETENTFRIENDS
+public:
+    DRW_Image() {
+        eType = DRW::IMAGE;
+        fade = clip = 0;
+        brightness = contrast = 50;
+    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+
+public:
+    // SHADOWS DRW_Line::encodeDwg — without this override an IMAGE would
+    // encode as a LINE (oType 19).  Emits oType 101 + the IMAGE body.
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+    std::uint32_t ref = 0;           /*!< Hard reference to imagedef object, code 340 */
+    std::uint32_t m_imageDefReactorHandle = 0; /*!< Hard owner to imagedefreactor, code 360 (DWG) */
+    int m_displayProps = 0;    /*!< Image display properties bitmask, code 70 (DWG) */
+    DRW_Coord vVector;         /*!< V-vector of single pixel, x coordinate, code 12, 22 & 32 */
+//    double vx;                 /*!< V-vector of single pixel, x coordinate, code 12 */
+//    double vy;                 /*!< V-vector of single pixel, y coordinate, code 22 */
+//    double vz;                 /*!< V-vector of single pixel, z coordinate, code 32 */
+    double sizeu = 0.0;        /*!< image size in pixels, U value, code 13 */
+    double sizev = 0.0;        /*!< image size in pixels, V value, code 23 */
+    double dz = 0.0;           /*!< z coordinate, code 33 */
+    int clip;                  /*!< Clipping state, code 280, 0=off 1=on */
+    int brightness;            /*!< Brightness value, code 281, (0-100) default 50 */
+    int contrast;              /*!< Brightness value, code 282, (0-100) default 50 */
+    int fade;                  /*!< Brightness value, code 283, (0-100) default 0 */
+    /* Clip boundary type: 0=unset/auto, 1=rectangular (2 corner pts), 2=polygon.
+       DXF group code 71 in AcDbRasterImage / AcDbWipeout; DWG clipType BS. */
+    int m_clipBoundaryType = 0;
+    /* Polygonal clip boundary in image-pixel coordinates (DXF codes 91 + 14/24,
+       or DWG image-clip block).  Populated for both raster IMAGEs (when a clip
+       is set) and WIPEOUTs (where this is the only meaningful payload). */
+    std::vector<DRW_Coord> clipPath;
+    /* R2010+ Clip mode (ODA spec §20.4.80, DXF group 290): 0 = outside the
+       polygon is masked (typical WIPEOUT), 1 = inside is masked. NOT a frame
+       display flag — the WIPEOUTFRAME concept is a global drawing variable in
+       the WIPEOUTVARIABLES OBJECTS-section object, not per-entity. */
+    bool clipMode = false;
+
+    /// True only when the stored IMAGE/WIPEOUT clipping payload matches its
+    /// declared type. Type 1 is two opposite rectangle corners; type 2 is a
+    /// polygon with at least three vertices; type 0 carries no payload.
+    bool hasValidClipBoundary() const;
+
+protected:
+    std::int32_t m_declaredClipVertexCount {-1};
+    bool m_clipPathHasOpenVertex {false};
+
+};
+
+//! Class to handle WIPEOUT entity (AcDbWipeout)
+/*!
+*  Class to handle WIPEOUT entity. WIPEOUT shares the AcDbRasterImage
+*  binary layout with IMAGE but carries no actual raster data — only
+*  the clip boundary polygon. Inherits from DRW_Image for code reuse.
+*  @author LibreCAD
+*/
+class DRW_Wipeout : public DRW_Image {
+    SETENTFRIENDS
+public:
+    // DWG custom-class ordinals are file-local to this writer. 526–528 are
+    // UNDERLAY *definition* classes (PDF/DGN/DWF); WIPEOUTVARIABLES is 529.
+    // Use 530 so WIPEOUT never collides with PDFUNDERLAYDEFINITION (526).
+    static constexpr std::uint16_t kDwgClassNum = 530;
+
+    DRW_Wipeout() {
+        eType = DRW::WIPEOUT;
+        fade = clip = 0;
+        brightness = contrast = 50;
+        m_clipBoundaryType = 2;
+    }
+
+    /// WIPEOUT is meaningful only with a rectangle or polygon boundary.
+    bool hasValidBoundary() const;
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+struct DRW_PointCloudIntensityStyle {
+    double minIntensity = 0.0;
+    double maxIntensity = 0.0;
+    double lowThreshold = 0.0;
+    double highThreshold = 0.0;
+};
+
+struct DRW_PointCloudClipping {
+    bool isInverted = false;
+    int type = 0;
+    int vertexCount = 0;
+    std::vector<DRW_Coord> vertices;
+    double zMin = 0.0;
+    double zMax = 0.0;
+};
+
+class DRW_PointCloud : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_PointCloud() { eType = DRW::POINTCLOUD; }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    std::uint32_t classVersion = 0;
+    DRW_Coord origin;
+    UTF8STRING savedFilename;
+    int sourceFileCount = 0;
+    std::vector<UTF8STRING> sourceFiles;
+    DRW_Coord extentsMin;
+    DRW_Coord extentsMax;
+    std::uint64_t pointCount = 0;
+    UTF8STRING ucsName;
+    DRW_Coord ucsOrigin;
+    DRW_Coord ucsXDirection;
+    DRW_Coord ucsYDirection;
+    DRW_Coord ucsZDirection;
+    std::uint32_t definitionHandle = 0;
+    std::uint32_t reactorHandle = 0;
+    bool showIntensity = false;
+    int intensityScheme = 0;
+    DRW_PointCloudIntensityStyle intensityStyle;
+    bool showClipping = false;
+    int clippingCount = 0;
+    std::vector<DRW_PointCloudClipping> clippings;
+};
+
+struct DRW_PointCloudExCropping {
+    int type = 0;
+    bool isInside = false;
+    bool isInverted = false;
+    DRW_Coord cropPlane;
+    DRW_Coord cropXDirection;
+    DRW_Coord cropYDirection;
+    int pointCount = 0;
+    std::vector<DRW_Coord> points;
+};
+
+class DRW_PointCloudEx : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_PointCloudEx() { eType = DRW::POINTCLOUDEX; }
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    std::uint32_t classVersion = 0;
+    DRW_Coord extentsMin;
+    DRW_Coord extentsMax;
+    DRW_Coord ucsOrigin;
+    DRW_Coord ucsXDirection;
+    DRW_Coord ucsYDirection;
+    DRW_Coord ucsZDirection;
+    bool isLocked = false;
+    std::uint32_t definitionHandle = 0;
+    std::uint32_t reactorHandle = 0;
+    UTF8STRING name;
+    bool showIntensity = false;
+    bool showCropping = false;
+    int croppingCount = 0;
+    int unknownInt0 = 0;
+    int unknownInt1 = 0;
+    int stylizationType = 0;
+    UTF8STRING intensityColorScheme;
+    UTF8STRING currentColorScheme;
+    UTF8STRING classificationColorScheme;
+    double elevationMin = 0.0;
+    double elevationMax = 0.0;
+    double intensityMin = 0.0;
+    double intensityMax = 0.0;
+    int intensityOutOfRangeBehavior = 0;
+    int elevationOutOfRangeBehavior = 0;
+    bool elevationApplyToFixedRange = false;
+    bool intensityAsGradient = false;
+    bool elevationAsGradient = false;
+    std::vector<DRW_PointCloudExCropping> croppings;
+};
+
+class DRW_Surface : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Surface() {}
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    int uIsolines = 0;
+    int vIsolines = 0;
+    int modelerFormatVersion = 0;
+    bool acisEmpty = false;
+    int acisVersion = 0;
+    std::vector<std::uint8_t> rawAcisData;
+
+    //! Lazily-decoded ACIS wireframe (from rawAcisData SAB payload).
+    DRW_AcisBrep m_wireframe;
+    bool m_wireframeDecoded = false;
+    //! Decode the SAB wireframe from rawAcisData on demand. Idempotent; never throws.
+    bool decodeWireframe() {
+        if (!m_wireframeDecoded) {
+            m_wireframeDecoded = true;
+            drw_decodeAcisWireframe(rawAcisData, m_wireframe);
+        }
+        return !m_wireframe.empty();
+    }
+};
+
+class DRW_PlaneSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_PlaneSurface() { eType = DRW::PLANESURFACE; }
+};
+
+class DRW_ExtrudedSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_ExtrudedSurface() { eType = DRW::EXTRUDEDSURFACE; }
+};
+
+class DRW_RevolvedSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_RevolvedSurface() { eType = DRW::REVOLVEDSURFACE; }
+};
+
+class DRW_SweptSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_SweptSurface() { eType = DRW::SWEPTSURFACE; }
+};
+
+class DRW_LoftedSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_LoftedSurface() { eType = DRW::LOFTEDSURFACE; }
+};
+
+class DRW_NurbsSurface : public DRW_Surface {
+    SETENTFRIENDS
+public:
+    DRW_NurbsSurface() { eType = DRW::NURBSURFACE; }
+};
+
+
+//! Base class for dimension entity
+/*!
+*  Base class for dimension entity
+*  @author Rallaz
+*/
+class DRW_Dimension : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Dimension() {
+        eType = DRW::DIMENSION;
+        type = 0;
+        linesty = 1;
+        linefactor = extPoint.z = 1.0;
+        angle = oblique = rot = 0.0;
+        align = 5;
+        style = "STANDARD";
+        defPoint.z = extPoint.x = extPoint.y = 0;
+        textPoint.z = rot = 0;
+        clonePoint.x = clonePoint.y = clonePoint.z = 0;
+    }
+
+    DRW_Dimension(const DRW_Dimension& d): DRW_Entity(d) {
+        eType = DRW::DIMENSION;
+        type = d.type;
+        name = d.name;
+        defPoint = d.defPoint;
+        textPoint = d.textPoint;
+        text = d.text;
+        style = d.style;
+        align = d.align;
+        linesty = d.linesty;
+        linefactor = d.linefactor;
+        rot = d.rot;
+        extPoint = d.extPoint;
+        clonePoint = d.clonePoint;
+        def1 = d.def1;
+        def2 = d.def2;
+        angle = d.angle;
+        oblique = d.oblique;
+        arcPoint = d.arcPoint;
+        circlePoint = d.circlePoint;
+        length = d.length;
+        measureValue = d.measureValue;
+        hdir = d.hdir;
+        flipArrow1 = d.flipArrow1;
+        flipArrow2 = d.flipArrow2;
+        genTol = d.genTol;
+        limGen = d.limGen;
+        tolPlus = d.tolPlus;
+        tolMinus = d.tolMinus;
+        tolScale = d.tolScale;
+        tolDecimals = d.tolDecimals;
+        tolAlign = d.tolAlign;
+        tolZero = d.tolZero;
+        altTolDecimals = d.altTolDecimals;
+        altZero = d.altZero;
+        altTolZero = d.altTolZero;
+        textMove = d.textMove;
+    }
+    virtual ~DRW_Dimension() = default;
+
+    void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer *sBuf, std::uint32_t bs = 0) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer* buf, std::uint32_t bs=0) override;
+    bool encodeDwgDimBase(DRW::Version version, dwgBufferW *buf,
+                          dwgBufferW *strBuf = nullptr) const;
+
+public:
+    DRW_Coord getDefPoint() const {return defPoint;}      /*!< Definition point, code 10, 20 & 30 */
+    void setDefPoint(const DRW_Coord p) {defPoint =p;}
+    DRW_Coord getTextPoint() const {return textPoint;}    /*!< Middle point of text, code 11, 21 & 31 */
+    void setTextPoint(const DRW_Coord p) {textPoint =p;}
+    std::string getStyle() const {return style;}          /*!< Dimension style, code 3 */
+    void setStyle(const std::string s) {style = s;}
+    int getAlign() const { return align;}                 /*!< attachment point, code 71 */
+    void setAlign(const int a) { align = a;}
+    int getTextLineStyle() const { return linesty;}       /*!< Dimension text line spacing style, code 72, default 1 */
+    void setTextLineStyle(const int l) { linesty = l;}
+    std::string getText() const {return text;}            /*!< Dimension text explicitly entered by the user, code 1 */
+    void setText(const std::string t) {text = t;}
+    double getTextLineFactor() const { return linefactor;} /*!< Dimension text line spacing factor, code 41, default 1? */
+    void setTextLineFactor(const double l) { linefactor = l;}
+    double getDir() const { return rot;}                  /*!< rotation angle of the dimension text, code 53 (optional) default 0 */
+    void setDir(const double d) { rot = d;}
+    double getHDir() const { return hdir; }              /*!< horizontal direction, code 51 */
+    void setHDir(const double d) { hdir = d; }
+    bool getFlipArrow1() const { return flipArrow1; }    /*!< flip arrow 1 flag, code 74 */
+    bool getFlipArrow2() const { return flipArrow2; }    /*!< flip arrow 2 flag, code 75 */
+    void setFlipArrow1(bool v) { flipArrow1 = v; }
+    void setFlipArrow2(bool v) { flipArrow2 = v; }
+
+    DRW_Coord getExtrusion() const {return extPoint;}            /*!< extrusion, code 210, 220 & 230 */
+    void setExtrusion(const DRW_Coord p) {extPoint =p;}
+    std::string getName(){return name;}                   /*!< Name of the block that contains the entities, code 2 */
+    void setName(const std::string s) {name = s;}
+//    int getType(){ return type;}                      /*!< Dimension type, code 70 */
+    double getMeasureValue() const { return measureValue; }  /*!< Real measure value (optional; read only), code 42 */
+
+protected:
+    DRW_Coord getPt2() const {return clonePoint;}
+    void setPt2(const DRW_Coord p) {clonePoint= p;}
+    DRW_Coord getPt3() const {return def1;}
+    void setPt3(const DRW_Coord p) {def1= p;}
+    DRW_Coord getPt4() const {return def2;}
+    void setPt4(const DRW_Coord p) {def2= p;}
+    DRW_Coord getPt5() const {return circlePoint;}
+    void setPt5(const DRW_Coord p) {circlePoint= p;}
+    DRW_Coord getPt6() const {return arcPoint;}
+    void setPt6(const DRW_Coord p) {arcPoint= p;}
+    double getAn50() const {return angle;}      /*!< Angle of rotated, horizontal, or vertical dimensions, code 50 */
+    void setAn50(const double d) {angle = d;}
+    double getOb52() const {return oblique;}    /*!< oblique angle, code 52 */
+    void setOb52(const double d) {oblique = d;}
+    double getRa40() const {return length;}    /*!< Leader length, code 40 */
+    void setRa40(const double d) {length = d;}
+public:
+    int type;                  /*!< Dimension type, code 70 */
+private:
+    std::string name;          /*!< Name of the block that contains the entities, code 2 */
+    DRW_Coord defPoint;        /*!<  definition point, code 10, 20 & 30 (WCS) */
+    DRW_Coord textPoint;       /*!< Middle point of text, code 11, 21 & 31 (OCS) */
+    UTF8STRING text;           /*!< Dimension text explicitly entered by the user, code 1 */
+    UTF8STRING style;          /*!< Dimension style, code 3 */
+    int align;                 /*!< attachment point, code 71 */
+    int linesty;               /*!< Dimension text line spacing style, code 72, default 1 */
+    double linefactor;         /*!< Dimension text line spacing factor, code 41, default 1? (value range 0.25 to 4.00*/
+    double rot;                /*!< rotation angle of the dimension text, code 53 */
+    DRW_Coord extPoint;        /*!<  extrusion normal vector, code 210, 220 & 230 */
+
+    double hdir = 0.0;         /*!< horizontal direction for the dimension, code 51 */
+    DRW_Coord clonePoint;      /*!< Insertion point for clones (Baseline & Continue), code 12, 22 & 32 (OCS) */
+    DRW_Coord def1;            /*!< Definition point 1for linear & angular, code 13, 23 & 33 (WCS) */
+    DRW_Coord def2;            /*!< Definition point 2, code 14, 24 & 34 (WCS) */
+    double angle;              /*!< Angle of rotated, horizontal, or vertical dimensions, code 50 */
+    double oblique;            /*!< oblique angle, code 52 */
+
+    DRW_Coord circlePoint;     /*!< Definition point for diameter, radius & angular dims code 15, 25 & 35 (WCS) */
+    DRW_Coord arcPoint;        /*!< Point defining dimension arc, x coordinate, code 16, 26 & 36 (OCS) */
+    double length = 0.0;       /*!< Leader length, code 40 */
+    double measureValue = 0;   /*!< Real measure value (optional; read only), code 42 */
+    bool flipArrow1 {false};   /*!< force flip arrow 1, code 74 */
+    bool flipArrow2 {false};   /*!< force flip arrow 2, code 75 */
+
+    bool genTol {false};       /*!< generate tolerances flag, code 76 */
+    bool limGen {false};       /*!< limits generation flag, code 77 */
+    double tolPlus {0.0};      /*!< plus tolerance, code 43 */
+    double tolMinus {0.0};     /*!< minus tolerance, code 44 */
+    double tolScale {0.0};     /*!< tolerance scale factor, code 45 */
+    int tolDecimals {0};       /*!< tolerance decimal places, code 78 */
+    int tolAlign {0};          /*!< tolerance alignment, code 79 */
+    int tolZero {0};           /*!< tolerance zero handling, code 80 */
+    int altTolDecimals {0};    /*!< alternate unit tolerance decimal places, code 81 */
+    int altZero {0};           /*!< alternate unit zero handling, code 82 */
+    int altTolZero {0};        /*!< alternate unit tolerance zero handling, code 83 */
+    int textMove {0};          /*!< text movement rule, code 84 */
+
+protected:
+    dwgHandle dimStyleH;
+    dwgHandle blockH;
+};
+
+
+//! Class to handle  aligned dimension entity
+/*!
+*  Class to handle aligned dimension entity
+*  @author Rallaz
+*/
+class DRW_DimAligned : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimAligned(){
+        eType = DRW::DIMALIGNED;
+    }
+    DRW_DimAligned(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMALIGNED;
+    }
+
+    DRW_Coord getClonepoint() const {return getPt2();}      /*!< Insertion for clones (Baseline & Continue), 12, 22 & 32 */
+    void setClonePoint(DRW_Coord c){setPt2(c);}
+
+    DRW_Coord getDimPoint() const {return getDefPoint();}   /*!< dim line location point, code 10, 20 & 30 */
+    void setDimPoint(const DRW_Coord p){setDefPoint(p);}
+    DRW_Coord getDef1Point() const {return getPt3();}       /*!< Definition point 1, code 13, 23 & 33 */
+    void setDef1Point(const DRW_Coord p) {setPt3(p);}
+    DRW_Coord getDef2Point() const {return getPt4();}       /*!< Definition point 2, code 14, 24 & 34 */
+    void setDef2Point(const DRW_Coord p) {setPt4(p);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle  linear or rotated dimension entity
+/*!
+*  Class to handle linear or rotated dimension entity
+*  @author Rallaz
+*/
+class DRW_DimLinear : public DRW_DimAligned {
+public:
+    DRW_DimLinear() {
+        eType = DRW::DIMLINEAR;
+    }
+    DRW_DimLinear(const DRW_Dimension& d): DRW_DimAligned(d) {
+        eType = DRW::DIMLINEAR;
+    }
+
+    double getAngle() const {return getAn50();}          /*!< Angle of rotated, horizontal, or vertical dimensions, code 50 */
+    void setAngle(const double d) {setAn50(d);}
+    double getOblique() const {return getOb52();}      /*!< oblique angle, code 52 */
+    void setOblique(const double d) {setOb52(d);}
+
+protected:
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle radial dimension entity
+/*!
+*  Class to handle aligned, linear or rotated dimension entity
+*  @author Rallaz
+*/
+class DRW_DimRadial : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimRadial() {
+        eType = DRW::DIMRADIAL;
+    }
+    DRW_DimRadial(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMRADIAL;
+    }
+
+    DRW_Coord getCenterPoint() const {return getDefPoint();}   /*!< center point, code 10, 20 & 30 */
+    void setCenterPoint(const DRW_Coord p){setDefPoint(p);}
+    DRW_Coord getDiameterPoint() const {return getPt5();}      /*!< Definition point for radius, code 15, 25 & 35 */
+    void setDiameterPoint(const DRW_Coord p){setPt5(p);}
+    double getLeaderLength() const {return getRa40();}         /*!< Leader length, code 40 */
+    void setLeaderLength(const double d) {setRa40(d);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle large (jogged) radial dimension entity
+/*!
+*  AcDbRadialDimensionLarge (LARGE_RADIAL_DIMENSION, ODA §20.4.20): a radial
+*  dimension whose leader is jogged for large radii.  It carries the radial
+*  center (code 10) and chord point (mapped onto the radial diameter point so it
+*  renders through the existing addDimRadial path) plus a jog vertex (15/25/35),
+*  an overridden center (14/24/34) and a jog transverse angle (40). It is
+*  delivered via addDimRadial (this is-a DRW_DimRadial), so no new callback or
+*  consumer override is needed. The writer emits it as its own top-level DXF
+*  token / DWG custom class so the jog fields survive write-reopen.
+*/
+class DRW_DimLargeRadial : public DRW_DimRadial {
+    SETENTFRIENDS
+public:
+    DRW_DimLargeRadial() { eType = DRW::DIMRADIAL; }
+    DRW_DimLargeRadial(const DRW_Dimension& d) : DRW_DimRadial(d) { eType = DRW::DIMRADIAL; }
+
+    static constexpr std::uint16_t kDwgClassNum = 519; /*!< AcDbRadialDimensionLarge DWG custom class id */
+
+    DRW_Coord getChordPoint() const { return getPt5(); }   /*!< chord point on the arc, code 13/23/33 (== radial diameter point) */
+    void setChordPoint(const DRW_Coord p) { setPt5(p); }
+
+    DRW_Coord overrideCenterPoint;   /*!< overridden center, code 14/24/34 */
+    DRW_Coord jogPoint;              /*!< jog vertex, code 15/25/35 */
+    double    jogAngle = 0.;         /*!< jog transverse angle, code 40 */
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+private:
+    bool m_largeRadialSubclassSeen = false;
+};
+
+//! Class to handle radial dimension entity
+/*!
+*  Class to handle aligned, linear or rotated dimension entity
+*  @author Rallaz
+*/
+class DRW_DimDiametric : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimDiametric() {
+        eType = DRW::DIMDIAMETRIC;
+    }
+    DRW_DimDiametric(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMDIAMETRIC;
+    }
+
+    DRW_Coord getDiameter1Point() const {return getPt5();}      /*!< First definition point for diameter, code 15, 25 & 35 */
+    void setDiameter1Point(const DRW_Coord p){setPt5(p);}
+    DRW_Coord getDiameter2Point() const {return getDefPoint();} /*!< Opposite point for diameter, code 10, 20 & 30 */
+    void setDiameter2Point(const DRW_Coord p){setDefPoint(p);}
+    double getLeaderLength() const {return getRa40();}          /*!< Leader length, code 40 */
+    void setLeaderLength(const double d) {setRa40(d);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle angular dimension entity
+/*!
+*  Class to handle angular dimension entity
+*  @author Rallaz
+*/
+class DRW_DimAngular : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimAngular() {
+        eType = DRW::DIMANGULAR;
+    }
+    DRW_DimAngular(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMANGULAR;
+    }
+
+    DRW_Coord getFirstLine1() const {return getPt3();}       /*!< Definition point line 1-1, code 13, 23 & 33 */
+    void setFirstLine1(const DRW_Coord p) {setPt3(p);}
+    DRW_Coord getFirstLine2() const {return getPt4();}       /*!< Definition point line 1-2, code 14, 24 & 34 */
+    void setFirstLine2(const DRW_Coord p) {setPt4(p);}
+    DRW_Coord getSecondLine1() const {return getPt5();}      /*!< Definition point line 2-1, code 15, 25 & 35 */
+    void setSecondLine1(const DRW_Coord p) {setPt5(p);}
+    DRW_Coord getSecondLine2() const {return getDefPoint();} /*!< Definition point line 2-2, code 10, 20 & 30 */
+    void setSecondLine2(const DRW_Coord p){setDefPoint(p);}
+    DRW_Coord getDimPoint() const {return getPt6();}         /*!< Dimension definition point, code 16, 26 & 36 */
+    void setDimPoint(const DRW_Coord p) {setPt6(p);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+
+//! Class to handle angular 3p dimension entity
+/*!
+*  Class to handle angular 3p dimension entity
+*  @author Rallaz
+*/
+class DRW_DimAngular3p : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimAngular3p() {
+        eType = DRW::DIMANGULAR3P;
+    }
+    DRW_DimAngular3p(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMANGULAR3P;
+    }
+
+    DRW_Coord getFirstLine() const {return getPt3();}       /*!< Definition point line 1, code 13, 23 & 33 */
+    void setFirstLine(const DRW_Coord p) {setPt3(p);}
+    DRW_Coord getSecondLine() const {return getPt4();}       /*!< Definition point line 2, code 14, 24 & 34 */
+    void setSecondLine(const DRW_Coord p) {setPt4(p);}
+    DRW_Coord getVertexPoint() const {return getPt5();}      /*!< Vertex point, code 15, 25 & 35 */
+    void SetVertexPoint(const DRW_Coord p) {setPt5(p);}
+    DRW_Coord getDimPoint() const {return getDefPoint();}    /*!< Dimension definition point, code 10, 20 & 30 */
+    void setDimPoint(const DRW_Coord p) {setDefPoint(p);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+//! Class to handle arc length dimension entity (ARC_DIMENSION / AcDbArcDimension)
+class DRW_DimArc : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    static constexpr std::uint16_t kDwgClassNum = 500; /*!< DWG class number — must match writeDwgClasses */
+    DRW_DimArc() { eType = DRW::DIMARC; }
+    DRW_DimArc(const DRW_Dimension& d) : DRW_Dimension(d) { eType = DRW::DIMARC; }
+
+    DRW_Coord getArcDefPoint() const { return getDefPoint(); }   /*!< Arc dim-line arc point, code 10 */
+    void setArcDefPoint(DRW_Coord p) { setDefPoint(p); }
+    DRW_Coord getExtLine1() const { return getPt3(); }           /*!< Extension line 1 start, code 13 */
+    void setExtLine1(DRW_Coord p) { setPt3(p); }
+    DRW_Coord getExtLine2() const { return getPt4(); }           /*!< Extension line 2 start, code 14 */
+    void setExtLine2(DRW_Coord p) { setPt4(p); }
+    DRW_Coord getArcCenter() const { return getPt5(); }          /*!< Arc center point, code 15 */
+    void setArcCenter(DRW_Coord p) { setPt5(p); }
+    DRW_Coord getLeaderPt1() const { return getPt6(); }          /*!< Leader point 1, code 16 */
+    void setLeaderPt1(DRW_Coord p) { setPt6(p); }
+
+    DRW_Coord leaderPt2;           /*!< Leader point 2, code 17/27/37 */
+    double arcStartAngle = 0.;     /*!< Arc start angle, code 40 in AcDbArcDimension */
+    double arcEndAngle   = 0.;     /*!< Arc end angle, code 41 in AcDbArcDimension */
+    int    arcSymbol     = 0;      /*!< Arc symbol type, code 70 in AcDbArcDimension */
+    bool   isPartial     = false;  /*!< Partial arc flag, code 71 */
+    bool   hasLeader     = false;  /*!< Has leader flag (DWG only) */
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+private:
+    bool m_arcSubclassSeen = false;
+};
+
+//! Class to handle ordinate dimension entity
+/*!
+*  Class to handle ordinate dimension entity
+*  @author Rallaz
+*/
+class DRW_DimOrdinate : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimOrdinate() {
+        eType = DRW::DIMORDINATE;
+    }
+    DRW_DimOrdinate(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMORDINATE;
+    }
+
+    DRW_Coord getOriginPoint() const {return getDefPoint();}   /*!< Origin definition point, code 10, 20 & 30 */
+    void setOriginPoint(const DRW_Coord p) {setDefPoint(p);}
+    DRW_Coord getFirstLine() const {return getPt3();}          /*!< Feature location point, code 13, 23 & 33 */
+    void setFirstLine(const DRW_Coord p) {setPt3(p);}
+    DRW_Coord getSecondLine() const {return getPt4();}         /*!< Leader end point, code 14, 24 & 34 */
+    void setSecondLine(const DRW_Coord p) {setPt4(p);}
+
+protected:
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+};
+
+
+//! Class to handle leader entity
+/*!
+*  Class to handle leader entity
+*  @author Rallaz
+*/
+class DRW_Leader : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Leader() {
+        eType = DRW::LEADER;
+    }
+
+    virtual void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    UTF8STRING style;                            /*!< Dimension style name, code 3 */
+    int arrow {1};                               /*!< Arrowhead flag, code 71, 0=Disabled; 1=Enabled */
+    int leadertype {0};                          /*!< Leader path type, code 72, 0=Straight line segments; 1=Spline */
+    int flag {3};                                /*!< Leader creation flag, code 73, default 3 */
+    int hookline {1};                            /*!< Hook line direction flag, code 74, default 1 */
+    int hookflag {1};                            /*!< Hook line flag, code 75 */
+    double textheight {1.0};                     /*!< Text annotation height, code 40 */
+    double textwidth {1.0};                      /*!< Text annotation width, code 41 */
+    int vertnum {0};                             /*!< Number of vertices, code 76 */
+    int coloruse {7};                            /*!< Color to use if leader's DIMCLRD = BYBLOCK, code 77 */
+    std::uint32_t annotHandle {0};                     /*!< Hard reference to associated annotation, code 340 */
+    DRW_Coord extrusionPoint {0.0, 0.0, 1.0};    /*!< Normal vector, code 210, 220 & 230 */
+    DRW_Coord horizdir       {1.0, 0.0, 0.0};    /*!< "Horizontal" direction for leader, code 211, 221 & 231 */
+    DRW_Coord offsetblock;                       /*!< Offset of last leader vertex from block, code 212, 222 & 232 */
+    DRW_Coord offsettext;                        /*!< Offset of last leader vertex from annotation, code 213, 223 & 233 */
+
+    std::vector<std::shared_ptr<DRW_Coord>> vertexlist;  /*!< vertex points list, code 10, 20 & 30 */
+
+private:
+    std::shared_ptr<DRW_Coord> vertexpoint;   /*!< current control point to add data */
+    dwgHandle dimStyleH;
+    dwgHandle AnnotH;
+};
+
+//! Helper: a single leader-line within an MLEADER root.
+/*!
+ *  ODA spec §20.4.86 — describes one polyline emanating from a leader-root
+ *  connection point.  Owned by DRW_MLeaderRoot.
+ */
+struct DRW_MLeaderLeaderLine {
+    std::vector<DRW_Coord> points;                                  /*!< code 10 each */
+    std::vector<std::pair<DRW_Coord, DRW_Coord>> breaks;            /*!< 11/12 pairs */
+    std::int32_t segmentIndex = 0;                                        /*!< code 90 */
+    std::int32_t leaderLineIndex = 0;                                     /*!< code 91 */
+    /* R2010+ override block: present when the line overrides the style. */
+    std::uint16_t overrideFlags = 0;                                      /*!< code 93 */
+    std::uint16_t leaderType = 1;                                         /*!< 0=invisible, 1=line, 2=spline */
+    int color = 0;                                                  /*!< code 92 */
+    std::uint16_t lineWeight = 0;                                         /*!< code 171 */
+    double arrowSize = 0.0;                                         /*!< code 40 */
+    dwgHandle lineTypeHandle{};                                     /*!< code 340 */
+    dwgHandle arrowHandle{};                                        /*!< code 341 */
+};
+
+//! Helper: one root attachment of an MLEADER, with its leader lines.
+struct DRW_MLeaderRoot {
+    bool isContentValid = true;                                     /*!< code 290 */
+    bool unknown291 = true;                                         /*!< code 291, ODA writes true */
+    DRW_Coord connectionPoint;                                      /*!< code 10 */
+    DRW_Coord direction;                                            /*!< code 11 */
+    std::vector<std::pair<DRW_Coord, DRW_Coord>> breaks;            /*!< 12/13 pairs */
+    std::int32_t leaderIndex = 0;                                         /*!< code 90 */
+    double landingDistance = 0.0;                                   /*!< code 40 */
+    std::vector<DRW_MLeaderLeaderLine> leaderLines;
+    std::uint16_t attachmentDirection = 0;                                /*!< R2010, code 271 */
+};
+
+//! Helper: full annotation-context payload (AcDbMLeaderObjectContextData).
+/*!
+ *  ODA spec §20.4.86.  Embedded inside a DRW_MLeader; carries the leader
+ *  geometry (roots & lines) and either text or block content.
+ */
+struct DRW_MLeaderAnnotContext {
+    std::vector<DRW_MLeaderRoot> roots;
+    /* common content fields */
+    double overallScale = 1.0;                                      /*!< code 40 */
+    DRW_Coord contentBasePoint;                                     /*!< code 10 */
+    double textHeight = 0.0;                                        /*!< code 41 */
+    double arrowHeadSize = 0.0;                                     /*!< code 140 */
+    double landingGap = 0.0;                                        /*!< code 145 */
+    std::uint16_t styleLeftAttach = 0;                                    /*!< code 174 */
+    std::uint16_t styleRightAttach = 0;                                   /*!< code 175 */
+    std::uint16_t textAlignType = 0;                                      /*!< code 176 */
+    std::uint16_t attachmentType = 0;                                     /*!< code 177 */
+    bool hasTextContents = false;                                   /*!< code 290 */
+    /* text-content branch */
+    UTF8STRING textLabel;                                           /*!< code 304 */
+    DRW_Coord textNormal;                                           /*!< code 11 */
+    dwgHandle textStyleHandle{};                                    /*!< code 340 */
+    DRW_Coord textLocation;                                         /*!< code 12 */
+    DRW_Coord textDirection;                                        /*!< code 13 */
+    double textRotation = 0.0;                                      /*!< code 42 */
+    double boundaryWidth = 0.0;                                     /*!< code 43 */
+    double boundaryHeight = 0.0;                                    /*!< code 44 */
+    double lineSpacingFactor = 1.0;                                 /*!< code 45 */
+    std::uint16_t lineSpacingStyle = 0;                                   /*!< code 170 */
+    int textColor = 0;                                              /*!< code 90 */
+    std::uint16_t alignment = 0;                                          /*!< code 171 */
+    std::uint16_t flowDirection = 0;                                      /*!< code 172 */
+    int bgFillColor = 0;                                            /*!< code 91 */
+    double bgScaleFactor = 1.5;                                     /*!< code 141 */
+    int bgTransparency = 0;                                         /*!< code 92 */
+    bool bgFillEnabled = false;                                     /*!< code 291 */
+    bool bgMaskFillOn = false;                                      /*!< code 292 */
+    std::uint16_t columnType = 0;                                         /*!< code 173 */
+    bool textHeightAuto = false;                                    /*!< code 293 */
+    double columnWidth = 0.0;                                       /*!< code 142 */
+    double columnGutter = 0.0;                                      /*!< code 143 */
+    bool columnFlowReversed = false;                                /*!< code 294 */
+    std::vector<double> columnSizes;                                /*!< code 144 repeated */
+    bool wordBreak = false;                                         /*!< code 295 */
+    /* block-content branch */
+    bool hasContentsBlock = false;                                  /*!< code 296 */
+    dwgHandle blockTableRecordHandle{};                             /*!< code 341 */
+    DRW_Coord blockNormal;                                          /*!< code 14 */
+    DRW_Coord blockLocation;                                        /*!< code 15 */
+    DRW_Coord blockScale;                                           /*!< code 16 */
+    double blockRotation = 0.0;                                     /*!< code 46 */
+    int blockColor = 0;                                             /*!< code 93 */
+    /* 16 doubles forming the complete transformation matrix; rotation -> OCS->WCS
+       (using normal) -> scaling (using scale vector) -> translation (using location) */
+    std::array<double, 16> blockTransform{};                        /*!< code 47 */
+    /* common tail */
+    DRW_Coord basePoint;                                            /*!< code 110 */
+    DRW_Coord baseDirection;                                        /*!< code 111 */
+    DRW_Coord baseVertical;                                         /*!< code 112 */
+    bool isNormalReversed = false;                                  /*!< code 297 */
+    std::uint16_t styleTopAttach = 0;                                     /*!< R2010, code 273 */
+    std::uint16_t styleBottomAttach = 0;                                  /*!< R2010, code 272 */
+};
+
+//! Class to handle MULTILEADER (MLEADER) entity.
+/*!
+ *  Modern callout entity (AutoCAD 2008+).  AcDbMLeader subclass.  Combines
+ *  a multi-leader path geometry (roots → lines → points + breaks) with text
+ *  or block content.  ODA spec §20.4.48.
+ *
+ *  In DWG this is a custom-class object (oType >= 500) looked up by
+ *  classesmap recName == "MULTILEADER"; routed via dwgreader.cpp dispatch.
+ *
+ *  Style overrides: each entity carries an `overrideFlags` bitfield (code 90)
+ *  + the style handle (code 340); fields whose bits are set in overrideFlags
+ *  shadow the corresponding values from the referenced MLEADERSTYLE.
+ */
+class DRW_MLeader : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_MLeader() {
+        eType = DRW::MLEADER;
+    }
+
+    virtual void applyExtrusion() override {}
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    /* DXF CONTEXT_DATA{} state machine (§20.4.86).  Routes the nested-block
+       group codes (whose meaning depends on the open block) into `context`.
+       Returns true when the code belongs to the context block (consumed);
+       false when at entity level so parseCode falls through to its own switch. */
+    bool parseDxfContextCode(int code, const std::unique_ptr<dxfReader>& reader);
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0,
+                           dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    static constexpr std::uint16_t kDwgClassNum = 501;                   /*!< DWG custom class number */
+    DRW_MLeaderAnnotContext context;
+
+    /* R2010b+ class version (BS, code 270; default 2). Per libreDWG
+       dwg2.spec:1303-1306; the field is absent in pre-R2010b streams. */
+    std::uint16_t classVersion = 2;                                       /*!< code 270, R2010b+ */
+
+    /* Entity-level fields per §20.4.48.  Overrides the corresponding
+       MLEADERSTYLE field iff the matching bit is set in `overrideFlags`. */
+    dwgHandle styleHandle{};                                        /*!< code 340 */
+    std::int32_t overrideFlags = 0;                                       /*!< code 90 — bit-field, 1<<0 .. 1<<29 */
+    std::uint16_t leaderType = 1;                                         /*!< code 170: 0=invisible, 1=line, 2=spline */
+    int leaderColor = 0;                                            /*!< code 91 */
+    dwgHandle leaderLineTypeHandle{};                               /*!< code 341 */
+    std::int32_t leaderLineWeight = 0;                                    /*!< code 171 */
+    bool landingEnabled = true;                                     /*!< code 290 */
+    bool doglegEnabled = true;                                      /*!< code 291 */
+    double landingDistance = 0.0;                                   /*!< code 41 */
+    dwgHandle arrowHeadHandle{};                                    /*!< code 342 */
+    double defaultArrowHeadSize = 0.0;                              /*!< code 42 */
+    std::uint16_t styleContentType = 2;                                   /*!< code 172: 0=None, 1=Block, 2=MTEXT, 3=TOLERANCE */
+    dwgHandle styleTextStyleHandle{};                               /*!< code 343 */
+    std::uint16_t styleLeftAttach = 0;                                    /*!< code 173 */
+    std::uint16_t styleRightAttach = 0;                                   /*!< code 95 */
+    std::uint16_t styleTextAngleType = 0;                                 /*!< code 174 */
+    std::uint16_t unknown175 = 0;                                         /*!< code 175 */
+    int styleTextColor = 0;                                         /*!< code 92 */
+    bool styleTextFrameEnabled = false;                             /*!< code 292 */
+    dwgHandle styleBlockHandle{};                                   /*!< code 344 (optional) */
+    int styleBlockColor = 0;                                        /*!< code 93 */
+    DRW_Coord styleBlockScale{1, 1, 1};                             /*!< code 10 */
+    double styleBlockRotation = 0.0;                                /*!< code 43 */
+    std::uint16_t styleAttachmentType = 0;                                /*!< code 176 */
+    bool isAnnotative = false;                                      /*!< code 293 */
+
+    /* R2007 array fields (pre-R2010 only). */
+    struct ArrowHeadEntry {
+        bool isDefault = true;                                      /*!< code 94 */
+        dwgHandle handle{};                                         /*!< code 345 */
+    };
+    struct BlockLabelEntry {
+        dwgHandle attDefHandle{};                                   /*!< code 330 */
+        UTF8STRING labelText;                                       /*!< code 302 */
+        std::uint16_t uiIndex = 0;                                        /*!< code 177 */
+        double width = 0.0;                                         /*!< code 44 */
+    };
+    std::vector<ArrowHeadEntry> arrowHeads;                         /*!< pre-R2010 */
+    std::vector<BlockLabelEntry> blockLabels;                       /*!< pre-R2010 */
+
+    bool isTextDirectionNegative = false;                           /*!< code 294 */
+    std::uint16_t ipeAlign = 0;                                           /*!< code 178 */
+    std::uint16_t justification = 0;                                      /*!< code 179: 1=left, 2=center, 3=right */
+    double scaleFactor = 1.0;                                       /*!< code 45 */
+
+    /* R2010+ */
+    std::uint16_t attachmentDirection = 0;                                /*!< code 271 */
+    std::uint16_t styleTopAttach = 0;                                     /*!< code 273 */
+    std::uint16_t styleBottomAttach = 0;                                  /*!< code 272 */
+
+    /* R2013+ */
+    bool leaderExtendedToText = false;                              /*!< code 295 */
+
+private:
+    /* Transient DXF parse state for the CONTEXT_DATA{} nested-block machine:
+       0 = entity level, 1 = inside CONTEXT_DATA{}, 2 = inside LEADER{},
+       3 = inside LEADER_LINE{}.  Not serialized; reset per fresh entity. */
+    int m_dxfCtxState = 0;
+};
+
+//! Class to handle viewport entity
+/*!
+*  Class to handle viewport entity
+*  @author Rallaz
+*/
+class DRW_Viewport : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Viewport() {
+        eType = DRW::VIEWPORT;
+        vpstatus = 0;
+        pswidth = 205;
+	        psheight = 156;
+	        centerPX = 128.5;
+	        centerPY = 97.5;
+	        m_sunHandle = 0;
+	    }
+
+protected:
+    bool parseCode(int code, const std::unique_ptr<dxfReader>& reader) override;
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, std::uint32_t bs=0) override;
+    [[nodiscard]] virtual bool encodeDwg(DRW::Version version, dwgBufferW *buf, std::uint32_t bs=0, dwgBufferW *strBuf=nullptr, dwgBufferW *handleBuf=nullptr) override;
+
+public:
+    double pswidth;           /*!< Width in paper space units, code 40 */
+    double psheight;          /*!< Height in paper space units, code 41 */
+    int vpstatus;             /*!< Viewport status, code 68 */
+    int vpID = 0;             /*!< Viewport ID, code 69 */
+    double centerPX;          /*!< view center point X, code 12 */
+    double centerPY;          /*!< view center point Y, code 22 */
+    double snapPX = 0.0;    /*!< Snap base point X, code 13 */
+    double snapPY = 0.0;    /*!< Snap base point Y, code 23 */
+    double snapSpPX = 0.0;    /*!< Snap spacing X, code 14 */
+    double snapSpPY = 0.0;    /*!< Snap spacing Y, code 24 */
+    //TODO: complete in dxf
+    DRW_Coord viewDir;        /*!< View direction vector, code 16, 26 & 36 */
+    DRW_Coord viewTarget;     /*!< View target point, code 17, 27, 37 */
+    double viewLength = 0.0;  /*!< Perspective lens length, code 42 */
+    double frontClip = 0.0;   /*!< Front clip plane Z value, code 43 */
+    double backClip = 0.0;    /*!< Back clip plane Z value, code 44 */
+    double viewHeight = 0.0;  /*!< View height in model space units, code 45 */
+    double snapAngle = 0.0;   /*!< Snap angle, code 50 */
+    double twistAngle = 0.0;  /*!< view twist angle, code 51 */
+    std::uint32_t m_sunHandle = 0;    /*!< R2007+ SUN hard-owner ref (DWG-only) */
+
+    double gridSpX = 0.0;        /*!< Grid spacing X, code 15 */
+    double gridSpY = 0.0;        /*!< Grid spacing Y, code 25 */
+    double circleZoom = 0.0;     /*!< Circle zoom percent, code 46 */
+    int majorGridLines = 0;      /*!< Major grid lines per minor, code 72 */
+    int statusFlags = 0;         /*!< Status flags, code 90 */
+    UTF8STRING styleSheet;       /*!< Style sheet, code 1 */
+    int renderMode = 0;          /*!< Render mode, code 281 */
+    bool ucsAtOrigin = false;    /*!< UCS at origin flag, code 71 */
+    bool ucsPerViewport = false; /*!< UCS per viewport flag, code 74 */
+    DRW_Coord ucsOrigin;         /*!< UCS origin, code 110, 120, 130 */
+    DRW_Coord ucsXAxis;          /*!< UCS X axis, code 111, 121, 131 */
+    DRW_Coord ucsYAxis;          /*!< UCS Y axis, code 112, 122, 132 */
+    double ucsElevation = 0.0;   /*!< UCS elevation, code 146 */
+    int ucsOrthographicType = 0; /*!< UCS orthographic type, code 76 */
+    int shadePlotMode = 0;       /*!< Shade plot mode, code 148 */
+    bool useDefaultLighting = false;  /*!< Use default lighting, code 292 */
+    int defaultLightingType = 0; /*!< Default lighting type, code 282 */
+    double brightness = 0.0;     /*!< Brightness, code 451 */
+    double contrast = 0.0;       /*!< Contrast, code 452 */
+    int ambientColorRgb = -1;    /*!< Ambient color RGB, code 421 */
+    std::uint8_t ambientColorMethod = 0; /*!< Ambient color method, code 431 */
+
+    std::uint32_t vpHeaderHandle = 0;   /*!< Viewport entity header handle, code 331 */
+    std::uint32_t clipBoundaryHandle = 0; /*!< Clip boundary handle, code 340 */
+    std::uint32_t namedUcsHandle = 0;   /*!< Named UCS handle, code 345 */
+    std::uint32_t baseUcsHandle = 0;    /*!< Base UCS handle, code 346 */
+    std::uint32_t backgroundHandle = 0; /*!< Background handle, code 347 */
+    std::uint32_t visualStyleHandle = 0; /*!< Visual style handle, code 348 */
+    std::uint32_t shadePlotHandle = 0;  /*!< Shade plot handle, code 349 */
+
+    std::vector<std::uint32_t> frozenLayerHandles; /*!< Frozen layer handles */
+
+private:
+    std::uint32_t frozenLyCount = 0;
+};
+
+//used  //DRW_Coord basePoint;      /*!<  base point, code 10, 20 & 30 */
+
+//double thickness;         /*!< thickness, code 39 */
+//DRW_Coord extPoint;       /*!<  Dir extrusion normal vector, code 210, 220 & 230 */
+//enum DRW::ETYPE eType;     /*!< enum: entity type, code 0 */
+//std::uint32_t handle;            /*!< entity identifier, code 5 */
+//std::list<std::list<DRW_Variant> > appData; /*!< list of application data, code 102 */
+//std::uint32_t parentHandle;      /*!< Soft-pointer ID/handle to owner BLOCK_RECORD object, code 330 */
+//DRW::Space space;          /*!< space indicator, code 67*/
+//UTF8STRING layer;          /*!< layer name, code 8 */
+//UTF8STRING lineType;       /*!< line type, code 6 */
+//std::uint32_t material;          /*!< hard pointer id to material object, code 347 */
+//int color;                 /*!< entity color, code 62 */
+//enum DRW_LW_Conv::lineWidth lWeight; /*!< entity lineweight, code 370 */
+//double ltypeScale;         /*!< linetype scale, code 48 */
+//bool visible;              /*!< entity visibility, code 60 */
+//int numProxyGraph;         /*!< Number of bytes in proxy graphics, code 92 */
+//std::string proxyGraphics; /*!< proxy graphics bytes, code 310 */
+//int color24;               /*!< 24-bit color, code 420 */
+//std::string colorName;     /*!< color name, code 430 */
+//int transparency;          /*!< transparency, code 440 */
+//int plotStyle;             /*!< hard pointer id to plot style object, code 390 */
+//DRW::ShadowMode shadow;    /*!< shadow mode, code 284 */
+//bool haveExtrusion;        /*!< set to true if the entity have extrusion*/
+
+#endif
+
+// EOF

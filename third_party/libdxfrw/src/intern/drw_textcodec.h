@@ -1,0 +1,94 @@
+#ifndef DRW_TEXTCODEC_H
+#define DRW_TEXTCODEC_H
+
+#include <string>
+#include <string_view>
+#include <memory>
+#include "../drw_base.h"
+
+class DRW_Converter;
+
+class DRW_TextCodec
+{
+public:
+    DRW_TextCodec();
+    ~DRW_TextCodec();
+    std::string fromUtf8(std::string_view s);
+    std::string toUtf8(std::string_view s);
+    int getVersion(){return version;}
+    void setVersion(const std::string &v, bool dxfFormat);
+    void setVersion(DRW::Version v, bool dxfFormat);
+    void setCodePage(const std::string &c, bool dxfFormat);
+    std::string getCodePage(){return cp;}
+
+private:
+    std::string correctCodePage(const std::string& s);
+
+private:
+    DRW::Version version{DRW::UNKNOWNV};
+    std::string cp;
+    std::unique_ptr< DRW_Converter> conv;
+};
+
+class DRW_Converter
+{
+public:
+    DRW_Converter(const int *t, int l)
+        :table{t }
+        ,cpLength{l}
+    {}
+    virtual ~DRW_Converter()=default;
+    virtual std::string fromUtf8(std::string_view s) {return std::string{s};}
+    virtual std::string toUtf8(std::string_view s);
+    std::string encodeText(const std::string& stmp);
+    std::string decodeText(int c);
+    std::string encodeNum(int c);
+    int decodeNum(const std::string& s, int *b);
+    /// Decode a `\M+cXXXX` MIF escape (8 chars; c=selector 1..5, XXXX=hex
+    /// of a 2-byte sequence in the selector's codepage) to UTF-8.
+    /// Selector mapping: 1→ANSI_932, 2→ANSI_950, 3→ANSI_949,
+    /// 4→Johab(fallback ANSI_1252), 5→ANSI_936. Returns empty on invalid.
+    std::string encodeMifText(const std::string& tok);
+    const int *table{nullptr};
+    int cpLength;
+};
+
+class DRW_ConvUTF16 : public DRW_Converter {
+public:
+    DRW_ConvUTF16():DRW_Converter(nullptr, 0) {}
+    std::string fromUtf8(std::string_view s) override;
+    std::string toUtf8(std::string_view s) override;
+};
+
+class DRW_ConvTable : public DRW_Converter {
+public:
+    DRW_ConvTable(const int *t, int l):DRW_Converter(t, l) {}
+    std::string fromUtf8(std::string_view s) override;
+    std::string toUtf8(std::string_view s) override;
+};
+
+class DRW_ConvDBCSTable : public DRW_Converter {
+public:
+    DRW_ConvDBCSTable(const int *t,  const int *lt, const int dt[][2], int l)
+        :DRW_Converter(t, l)
+        ,leadTable{lt}
+        ,doubleTable{dt}
+    {}
+
+    std::string fromUtf8(std::string_view s) override;
+    std::string toUtf8(std::string_view s) override;
+private:
+    const int *leadTable{nullptr};
+    const int (*doubleTable)[2];
+
+};
+
+class DRW_Conv932Table : public DRW_Converter {
+public:
+    DRW_Conv932Table();
+    std::string fromUtf8(std::string_view s) override;
+    std::string toUtf8(std::string_view s) override;
+
+};
+
+#endif // DRW_TEXTCODEC_H
