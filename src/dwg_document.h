@@ -39,7 +39,8 @@ enum class ShapeKind {
     Circle,
     Arc,
     Polyline,
-    Text
+    Text,
+    Hatch
 };
 
 // Collapses DRW_Text::HAlign/VAlign (TEXT) and DRW_MText's 1-9 attachment
@@ -49,6 +50,34 @@ enum class ShapeKind {
 // to hit an exact width.
 enum class TextHAlign { Left, Center, Right };
 enum class TextVAlign { Baseline, Bottom, Middle, Top };
+
+// One closed boundary loop of a HATCH/MPOLYGON entity, in the same
+// points+bulges representation as Shape::points/bulges (empty bulges means
+// all-straight). A loop is always implicitly closed -- a boundary that
+// doesn't close back on itself can't bound a fillable area -- so unlike
+// Polyline there is no separate `closed` flag.
+struct HatchLoop {
+    std::vector<Point2D> points;
+    std::vector<double> bulges;
+};
+
+// One HATCH pattern definition line (DXF codes 53/43-46/79/49), already
+// converted to radians. Unlike Shape::dashPattern (built by
+// resolveEntityLineType from an LTYPE table entry, which is a *template*
+// requiring $LTSCALE/entity-scale to be applied), these lines are written
+// into the HATCH entity itself already baked to final world-space
+// angle/spacing/dash by whatever authored the file -- so DwgDocument::
+// addHatch copies them through as-is, with no further scaling.
+struct HatchPatternLine {
+    double angleRad = 0.0;
+    Point2D basePoint;
+    Point2D offset; // displacement between consecutive repeats of this line
+    // Raw DXF code-49 values (positive=dash, negative=gap, 0=dot). Empty
+    // means a solid (undashed) line. Unlike Shape::dashPattern, this can
+    // legitimately start with a gap, so it's kept in its raw signed form
+    // rather than resolved to the always-starts-with-dash convention.
+    std::vector<double> dashPattern;
+};
 
 struct Shape {
     ShapeKind kind;
@@ -96,6 +125,28 @@ struct Shape {
     double textAngleRad = 0.0;
     TextHAlign textHAlign = TextHAlign::Left;
     TextVAlign textVAlign = TextVAlign::Baseline;
+
+    // Hatch only: one or more closed boundary loops (an outer boundary
+    // plus any island holes). The viewer fills their union with an
+    // even-odd rule so islands read as holes regardless of each loop's own
+    // winding direction.
+    std::vector<HatchLoop> hatchLoops;
+
+    enum class HatchFillKind { Solid, Gradient, Pattern };
+    HatchFillKind hatchFillKind = HatchFillKind::Solid;
+
+    // Hatch/Gradient only. `color` above (already resolved) doubles as the
+    // first gradient stop; this is the second stop plus the gradient's
+    // axis angle (DXF code 460, already in radians). AutoCAD's gradient
+    // "centered" shift (code 461) isn't applied -- this always renders a
+    // centered two-stop gradient, which is the common case and a
+    // reasonable approximation of a shifted one.
+    RgbColor hatchColor2;
+    double hatchGradientAngleRad = 0.0;
+
+    // Hatch/Pattern only: the file's own pattern definition lines, already
+    // in radians -- see HatchPatternLine.
+    std::vector<HatchPatternLine> hatchPatternLines;
 };
 
 // 2D affine transform (x' = a*x + c*y + e; y' = b*x + d*y + f), used only to
@@ -168,13 +219,20 @@ public:
     void addAttDef(const DRW_Attdef &data) override;
     void addHeader(const DRW_Header *data) override;
     void addLType(const DRW_LType &data) override;
+    void addHatch(const DRW_Hatch *data) override;
+    void addDimAlign(const DRW_DimAligned *data) override;
+    void addDimLinear(const DRW_DimLinear *data) override;
+    void addDimRadial(const DRW_DimRadial *data) override;
+    void addDimDiametric(const DRW_DimDiametric *data) override;
+    void addDimAngular(const DRW_DimAngular *data) override;
+    void addDimAngular3P(const DRW_DimAngular3p *data) override;
+    void addDimStyle(const DRW_Dimstyle &data) override;
 
     // --- Everything else in DRW_Interface is a no-op for a pure viewer.
     // Header/table/style callbacks are read but not used; the write*()
     // callbacks are only invoked by libdxfrw when writing (we never call
     // write()), so they're dead code paths here, kept only to satisfy the
     // pure-virtual interface.
-    void addDimStyle(const DRW_Dimstyle &) override {}
     void addVport(const DRW_Vport &) override {}
     void addTextStyle(const DRW_Textstyle &) override {}
     void addAppId(const DRW_AppId &) override {}
@@ -188,16 +246,13 @@ public:
     void addTrace(const DRW_Trace &) override {}
     void add3dFace(const DRW_3Dface &) override {}
     void addSolid(const DRW_Solid &) override {}
-    void addDimAlign(const DRW_DimAligned *) override {}
-    void addDimLinear(const DRW_DimLinear *) override {}
-    void addDimRadial(const DRW_DimRadial *) override {}
-    void addDimDiametric(const DRW_DimDiametric *) override {}
-    void addDimAngular(const DRW_DimAngular *) override {}
-    void addDimAngular3P(const DRW_DimAngular3p *) override {}
+    // DIMORDINATE and arc-length (DIMARC) dimensions aren't implemented --
+    // their leader/jog geometry rules are distinct enough from the other
+    // six types (see CLAUDE.md) that they're left as a documented gap
+    // rather than approximated with the wrong shape.
     void addDimOrdinate(const DRW_DimOrdinate *) override {}
     void addDimArc(const DRW_DimArc *) override {}
     void addLeader(const DRW_Leader *) override {}
-    void addHatch(const DRW_Hatch *) override {}
     void addViewport(const DRW_Viewport &) override {}
     void addImage(const DRW_Image *) override {}
     void linkImage(const DRW_ImageDef *) override {}
@@ -265,6 +320,107 @@ private:
     // references it).
     void resolveInserts();
 
+    // --- Dimension rendering. This viewer synthesizes dimension geometry
+    // (extension lines, dimension line/arc, arrowheads, text) directly from
+    // each DIMENSION entity's own definition points, the same approach
+    // LibreCAD's RS_Dimension-derived classes take -- rather than trusting
+    // the anonymous block of pre-rendered graphics AutoCAD also writes into
+    // the file (DRW_Dimension::getName()), which this viewer never reads.
+
+    // Arrow size / extension-line offset+extend / text height for one
+    // DIMSTYLE, already multiplied by that style's own dimscale -- see
+    // addDimStyle. Values are in document units, ready to use directly.
+    struct DimStyleDefaults {
+        double arrowSize;
+        double extOffset;
+        double extExtend;
+        double textHeight;
+    };
+
+    // Looks up `styleName` (a dimension entity's own getStyle()) in
+    // dimStyles_ (populated by addDimStyle from the file's DIMSTYLE table)
+    // or falls back to dimStyles_["Standard"], then to the header-derived
+    // dimArrowSize_ etc.
+    //
+    // Both of those normally-reliable sources go silently missing at once
+    // for any DWG file: the vendored DWG reader's DRW_Dimstyle::parseDwg
+    // (third_party/libdxfrw/src/drw_objects.cpp) reads a DIMSTYLE table
+    // entry's *name* only, leaving dimasz/dimexo/dimexe/dimtxt/dimscale at
+    // DRW_Dimstyle::reset()'s literal factory-default values, and libdwgr
+    // never populates the $DIM* header variables either -- a real gap in
+    // that vendored file, not something to patch there silently (see
+    // CLAUDE.md). So for a DWG (this project's own teste.dwg included), the
+    // resolved style is indistinguishable from a genuine 0.18-unit-scale
+    // drawing, sized for a completely different drawing than the one
+    // actually being viewed.
+    //
+    // hasReliableDimHeaderVars_ (set in addHeader) tells the two cases
+    // apart: no header $DIM* vars at all is itself the DWG-gap signature
+    // (a real DXF's header always carries them, defaults or not). When
+    // that's true and the resolved style is bit-for-bit those same factory
+    // defaults, every dimension in the file -- not just this one -- shares
+    // the same unreliable-scale problem, so they all fall back to the SAME
+    // uniformFallbackDimStyle() (cached from the first dimension's own
+    // `referenceLength`, its measured length/radius) instead of each
+    // computing its own from its own measurement, which looked wildly
+    // inconsistent from one dimension to the next (e.g. a 500-unit and a
+    // 150-unit dimension elsewhere in the same drawing getting very
+    // differently sized arrows).
+    //
+    // A trustworthy result is then multiplied by dimScale_ ($DIMSCALE) --
+    // applied here rather than folded into dimStyles_/the header-fallback
+    // members themselves, since it's a document-wide multiplier on top of
+    // WHATEVER style ends up in effect, not specific to either source (a
+    // named style's own per-style dimscale field is exactly the kind of
+    // often-left-at-1.0 value this whole function distrusts -- e.g. this
+    // project's own teste.dxf, where the "ISO-25" DIMSTYLE table entry
+    // carries no dimscale override at all, yet the header's $DIMSCALE is
+    // 12 and very much does apply). Not applied to a fallback result from
+    // uniformFallbackDimStyle(), which is already derived from real
+    // document-space geometry.
+    //
+    // Finally, a per-entity "ACAD"/"DSTYLE" XDATA override on `dim` itself
+    // (AutoCAD's mechanism for "just this one dimension uses a different
+    // DIMSCALE/DIMTXT/etc than its named style") takes precedence over
+    // everything above -- see findDstyleXdataOverride. This is common in
+    // real files: this project's own teste.dxf has one on every dimension
+    // the initial bug report called out by value (500, 150, 930, 1015),
+    // each overriding DIMSCALE to 100 (not the header's 12) and DIMTXT to
+    // 2.6.
+    DimStyleDefaults resolveDimStyle(const DRW_Dimension &dim, double referenceLength);
+
+    // One arrow size shared by every dimension in a file with no
+    // trustworthy size data anywhere (see resolveDimStyle) -- cached on
+    // first use from whatever referenceLength that first dimension passed
+    // in, extension-line/text proportions derived from it the same way as
+    // AutoCAD's own factory defaults relate to its factory arrow size.
+    DimStyleDefaults uniformFallbackDimStyle(double referenceLength);
+
+    // Pushes a filled triangular arrowhead: tip at `tip`, pointing back
+    // along `dirAngleRad` (the direction from the tip toward the rest of
+    // the dimension/leader line) -- same standard proportions as most CAD
+    // renderers' default arrow (half-angle ~9.46 degrees).
+    void addDimensionArrow(Point2D tip, double dirAngleRad, double arrowSize, const RgbColor &color);
+    void addDimensionLine(Point2D p1, Point2D p2, const RgbColor &color);
+    void addDimensionArcShape(Point2D center, double radius, double startRad, double endRad, const RgbColor &color);
+    void addDimensionText(Point2D anchor, double angleRad, double textHeight, const std::string &text,
+                           const RgbColor &color);
+
+    // Shared by addDimAlign (theta = direction from p1 to p2) and
+    // addDimLinear (theta = the dimension's own rotation angle, code 50):
+    // both place a dimension line through `dimLinePt` parallel to `theta`,
+    // with extension lines dropped from p1/p2 to meet it.
+    void addLinearStyleDimension(const DRW_Dimension &dim, Point2D p1, Point2D p2, Point2D dimLinePt, double thetaRad);
+
+    // Shared by addDimAngular (vertex computed from the two edges'
+    // intersection) and addDimAngular3P (vertex given directly): draws the
+    // dimension arc between the rays vertex->edgePoint1 and
+    // vertex->edgePoint2, picking whichever of the two possible sweeps
+    // actually passes through `radiusThroughPoint` (which also sets the
+    // arc's radius).
+    void addAngularStyleDimension(const DRW_Dimension &dim, Point2D vertex, Point2D edgePoint1, Point2D edgePoint2,
+                                   Point2D radiusThroughPoint);
+
     std::vector<Shape> shapes_;
     BoundingBox bbox_;
     std::string errorMessage_;
@@ -272,6 +428,40 @@ private:
     std::unordered_map<std::string, std::string> layerLineTypes_;
     std::unordered_map<std::string, std::vector<double>> linePatterns_; // raw, unscaled (code-49 values)
     double globalLtScale_ = 1.0; // $LTSCALE header variable
+
+    // Fallback dimension style defaults, read from the header in
+    // addHeader() when present ($DIMASZ/$DIMEXO/$DIMEXE/$DIMTXT, raw --
+    // NOT yet times dimScale_, see resolveDimStyle) -- only ever populated
+    // for DXF (libdwgr, the DWG reader, never sets these header variables
+    // at all). AutoCAD's own factory defaults otherwise. Used by
+    // resolveDimStyle() only when the dimension's own named style isn't
+    // found in dimStyles_ below, which is the normal, reliable,
+    // format-independent source (see addDimStyle).
+    double dimArrowSize_ = 0.18;  // $DIMASZ
+    double dimExtOffset_ = 0.0625; // $DIMEXO -- gap between the measured point and its extension line
+    double dimExtExtend_ = 0.18;  // $DIMEXE -- how far the extension line runs past the dimension line
+    double dimTextHeight_ = 0.18; // $DIMTXT
+
+    // $DIMSCALE header variable -- a document-wide multiplier resolveDimStyle
+    // applies on top of whichever style (table or header-fallback) it
+    // resolves. Only DXF ever sets this (see hasReliableDimHeaderVars_).
+    double dimScale_ = 1.0;
+
+    // Whether addHeader actually found $DIMASZ or $DIMSCALE -- see
+    // resolveDimStyle's comment for why this is the signal that
+    // distinguishes a real (if possibly-factory-default) DXF DIMSTYLE from
+    // the DWG reader's parseDwg gap.
+    bool hasReliableDimHeaderVars_ = false;
+
+    // Cache for uniformFallbackDimStyle() -- negative means "not yet
+    // computed for this file".
+    double cachedDimFallbackArrowSize_ = -1.0;
+
+    // DIMSTYLE table entries (name -> raw sizing, NOT yet times dimScale_ --
+    // see resolveDimStyle), populated by addDimStyle(). Present for both
+    // DXF and DWG (though see resolveDimStyle for why DWG's own numeric
+    // fields can't be trusted).
+    std::unordered_map<std::string, DimStyleDefaults> dimStyles_;
 
     std::unordered_map<std::string, BlockDef> blocks_;
     std::vector<PendingInsert> topLevelInserts_;

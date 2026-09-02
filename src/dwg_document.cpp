@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "libdxfrw.h"
@@ -132,6 +133,22 @@ void DwgDocument::addLType(const DRW_LType &data) {
     linePatterns_[data.name] = data.path;
 }
 
+namespace {
+// Looks up a DOUBLE-typed header variable under either its DXF-style
+// "$NAME" key or the DWG reader's bare "NAME" key (see the $LTSCALE
+// comment below), writing into `out` and returning whether it was found.
+bool findDoubleHeaderVar(const DRW_Header &data, const char *dollarName, const char *bareName, double &out) {
+    for (const char *key : {dollarName, bareName}) {
+        auto it = data.vars.find(key);
+        if (it != data.vars.end() && it->second && it->second->type() == DRW_Variant::DOUBLE) {
+            out = it->second->d_val();
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
 void DwgDocument::addHeader(const DRW_Header *data) {
     if (!data) return;
     // DXF parsing keys header vars by the literal group-9 name, which
@@ -145,6 +162,29 @@ void DwgDocument::addHeader(const DRW_Header *data) {
             break;
         }
     }
+
+    // $DIMSCALE is a global multiplier AutoCAD applies on top of $DIMASZ/
+    // $DIMEXO/$DIMEXE/$DIMTXT -- and, per resolveDimStyle's comment, on top
+    // of a named DIMSTYLE table entry's own values too, not just these
+    // header-fallback ones (a drawing set up at a non-1:1 plot scale
+    // routinely sets only this, not each DIMSTYLE's own variables, so
+    // skipping it would leave arrows/text sized for a completely different
+    // scale -- potentially sub-pixel and invisible, as very nearly
+    // happened with this project's own test file). Applied in
+    // resolveDimStyle, not here, since it's a multiplier on WHATEVER style
+    // ends up in effect, not specifically these header values.
+    const bool hasDimScale = findDoubleHeaderVar(*data, "$DIMSCALE", "DIMSCALE", dimScale_);
+    if (dimScale_ <= 0.0) dimScale_ = 1.0;
+
+    const bool hasDimAsz = findDoubleHeaderVar(*data, "$DIMASZ", "DIMASZ", dimArrowSize_);
+    findDoubleHeaderVar(*data, "$DIMEXO", "DIMEXO", dimExtOffset_);
+    findDoubleHeaderVar(*data, "$DIMEXE", "DIMEXE", dimExtExtend_);
+    findDoubleHeaderVar(*data, "$DIMTXT", "DIMTXT", dimTextHeight_);
+
+    // See resolveDimStyle(): a DWG's header never carries either of these
+    // (libdwgr doesn't populate them), so finding one here is itself the
+    // signal that this file's dimension sizing is trustworthy.
+    hasReliableDimHeaderVars_ = hasDimAsz || hasDimScale;
 }
 
 namespace {
@@ -427,6 +467,13 @@ double effectiveScale(const Transform2D &t) {
 // approximation otherwise -- same tradeoff as effectiveScale().
 double effectiveRotation(const Transform2D &t) { return std::atan2(t.b, t.a); }
 
+// Transforms a pure direction/displacement (no translation) -- used for
+// HatchPatternLine::offset, which is a spacing vector between repeats, not
+// a position.
+Point2D applyLinear(const Transform2D &t, const Point2D &v) {
+    return {t.a * v.x + t.c * v.y, t.b * v.x + t.d * v.y};
+}
+
 Shape transformShape(const Shape &s, const Transform2D &t) {
     Shape out = s;
     const double scale = effectiveScale(t);
@@ -445,6 +492,20 @@ Shape transformShape(const Shape &s, const Transform2D &t) {
         // A mirrored insert (negative xscale/yscale) flips which way each
         // bulge segment curves.
         for (double &bulge : out.bulges) bulge = -bulge;
+    }
+
+    for (HatchLoop &loop : out.hatchLoops) {
+        for (auto &p : loop.points) p = applyTransform(t, p);
+        if (mirrored) {
+            for (double &bulge : loop.bulges) bulge = -bulge;
+        }
+    }
+    out.hatchGradientAngleRad = s.hatchGradientAngleRad + rotation;
+    for (HatchPatternLine &line : out.hatchPatternLines) {
+        line.basePoint = applyTransform(t, line.basePoint);
+        line.offset = applyLinear(t, line.offset);
+        line.angleRad = line.angleRad + rotation;
+        for (double &d : line.dashPattern) d *= scale; // scale is never negative -- sign (dash/gap) is preserved
     }
     return out;
 }
@@ -476,6 +537,90 @@ void DwgDocument::resolveInserts() {
     const Transform2D identity;
     for (const PendingInsert &insert : topLevelInserts_) instantiateInsert(insert, identity, 0);
 }
+
+namespace {
+bool hasAnyBulge(const std::vector<double> &bulges) {
+    return std::any_of(bulges.begin(), bulges.end(),
+                        [](double b) { return b != 0.0; });
+}
+
+// Builds one HatchLoop from a DRW_HatchLoop. Returns false for a loop this
+// viewer can't represent -- an edge-list loop containing anything besides
+// LINE/ARC (ELLIPSE and SPLINE boundary edges aren't implemented, same gap
+// as those entity types elsewhere -- see CLAUDE.md) -- so the caller can
+// drop the whole hatch rather than fill a boundary with a silently-patched
+// gap where an unsupported edge should have been.
+bool buildHatchLoop(const DRW_HatchLoop &loop, HatchLoop &out) {
+    constexpr int kPolylineFlag = 2;
+    if (loop.type & kPolylineFlag) {
+        if (loop.objlist.empty()) return false;
+        auto *pline = dynamic_cast<DRW_LWPolyline *>(loop.objlist.front().get());
+        if (!pline) return false;
+        out.points.reserve(pline->vertlist.size());
+        out.bulges.reserve(pline->vertlist.size());
+        for (const auto &v : pline->vertlist) {
+            out.points.push_back({v->x, v->y});
+            out.bulges.push_back(v->bulge);
+        }
+        if (!hasAnyBulge(out.bulges)) out.bulges.clear();
+        return out.points.size() >= 2;
+    }
+
+    // Edge-list loop: each edge contributes its start point (its end point
+    // is the next edge's start, or closes back to this loop's first point),
+    // exactly like a polyline vertex -- LINE edges are straight (bulge 0),
+    // ARC edges get the equivalent bulge for their sweep so the existing
+    // bulge->arc sampling (ViewerWidget::sampleSegmentPoints) draws them
+    // identically to a polyline-sourced boundary.
+    for (const auto &edge : loop.objlist) {
+        if (edge->eType == DRW::LINE) {
+            const auto *e = static_cast<const DRW_Line *>(edge.get());
+            out.points.push_back({e->basePoint.x, e->basePoint.y});
+            out.bulges.push_back(0.0);
+        } else if (edge->eType == DRW::ARC) {
+            const auto *e = static_cast<const DRW_Arc *>(edge.get());
+            double start = e->staangle;
+            double end = e->endangle;
+            double bulge;
+            if (e->isccw) {
+                if (end < start) end += 2.0 * M_PI;
+                bulge = std::tan((end - start) / 4.0);
+            } else {
+                if (end > start) end -= 2.0 * M_PI;
+                bulge = -std::tan((start - end) / 4.0);
+            }
+            out.points.push_back({e->basePoint.x + e->radious * std::cos(start),
+                                   e->basePoint.y + e->radious * std::sin(start)});
+            out.bulges.push_back(bulge);
+        } else {
+            return false; // ELLIPSE/SPLINE/etc. -- not supported yet
+        }
+    }
+    if (!hasAnyBulge(out.bulges)) out.bulges.clear();
+    return out.points.size() >= 2;
+}
+
+// Expands `loops` (bulge-aware, same reasoning as addShape's Polyline case)
+// into `bbox` -- shared so both the top-level and future block-local
+// bounding logic stay in sync with how the loops actually render.
+void expandHatchBounds(const std::vector<HatchLoop> &loops, BoundingBox &bbox) {
+    for (const HatchLoop &loop : loops) {
+        for (const auto &p : loop.points) bbox.expand(p);
+        const size_t n = loop.points.size();
+        if (loop.bulges.size() != n || n == 0) continue;
+        auto expandSegment = [&](size_t i, size_t j) {
+            Point2D center;
+            double radius = 0.0;
+            if (bulgeArcExtent(loop.points[i], loop.points[j], loop.bulges[i], center, radius)) {
+                bbox.expand(center.x - radius, center.y - radius);
+                bbox.expand(center.x + radius, center.y + radius);
+            }
+        };
+        for (size_t i = 0; i + 1 < n; ++i) expandSegment(i, i + 1);
+        expandSegment(n - 1, 0); // loops are always implicitly closed
+    }
+}
+} // namespace
 
 void DwgDocument::addShape(Shape shape) {
     if (insideBlock_) {
@@ -535,6 +680,9 @@ void DwgDocument::addShape(Shape shape) {
             bbox_.expand(shape.center.x + w, shape.center.y + h);
             break;
         }
+        case ShapeKind::Hatch:
+            expandHatchBounds(shape.hatchLoops, bbox_);
+            break;
     }
     shapes_.push_back(std::move(shape));
 }
@@ -571,12 +719,476 @@ void DwgDocument::addArc(const DRW_Arc &data) {
     addShape(std::move(s));
 }
 
+void DwgDocument::addHatch(const DRW_Hatch *data) {
+    if (!data) return;
+
+    Shape s;
+    s.kind = ShapeKind::Hatch;
+    s.color = resolveEntityColor(*data);
+
+    s.hatchLoops.reserve(data->looplist.size());
+    for (const auto &loopPtr : data->looplist) {
+        HatchLoop loop;
+        if (!buildHatchLoop(*loopPtr, loop)) return; // unsupported edge -- draw nothing, don't guess
+        s.hatchLoops.push_back(std::move(loop));
+    }
+    if (s.hatchLoops.empty()) return;
+
+    if (data->isGradient && data->gradColors.size() >= 2) {
+        s.hatchFillKind = Shape::HatchFillKind::Gradient;
+        // Stops aren't guaranteed to arrive in ascending `value` order.
+        auto stops = data->gradColors;
+        std::sort(stops.begin(), stops.end(),
+                  [](const DRW_Hatch::GradientStop &a, const DRW_Hatch::GradientStop &b) {
+                      return a.value < b.value;
+                  });
+        s.color = resolveDirectColor(stops.front().aciColor, stops.front().rgb);
+        s.hatchColor2 = resolveDirectColor(stops.back().aciColor, stops.back().rgb);
+        s.hatchGradientAngleRad = data->gradAngle;
+    } else if (data->solid) {
+        s.hatchFillKind = Shape::HatchFillKind::Solid;
+    } else {
+        s.hatchFillKind = Shape::HatchFillKind::Pattern;
+        s.hatchPatternLines.reserve(data->patternLines.size());
+        for (const DRW_Hatch::PatternLine &pl : data->patternLines) {
+            HatchPatternLine line;
+            line.angleRad = pl.angle * M_PI / 180.0;
+            line.basePoint = {pl.baseX, pl.baseY};
+            line.offset = {pl.offsetX, pl.offsetY};
+            line.dashPattern = pl.dashList;
+            s.hatchPatternLines.push_back(std::move(line));
+        }
+    }
+
+    addShape(std::move(s));
+}
+
 namespace {
-bool hasAnyBulge(const std::vector<double> &bulges) {
-    return std::any_of(bulges.begin(), bulges.end(),
-                        [](double b) { return b != 0.0; });
+// Trims a fixed-precision measurement string down to its shortest exact
+// form ("12.50" -> "12.5", "12.00" -> "12") -- this viewer has no access to
+// the file's own $DIMDEC precision setting, so it always formats at a fixed
+// precision and trims, rather than showing trailing zeros that weren't in
+// the original DIMSTYLE.
+std::string formatDimensionMeasurement(double value) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.2f", value);
+    std::string s(buf);
+    if (s.find('.') != std::string::npos) {
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    return s;
+}
+
+// Builds the dimension's text: the user's own override (code 1) if set,
+// substituting it for a literal "<>" placeholder when present (a common
+// real-world pattern, e.g. "<>+/-0.05"); otherwise `prefix` +
+// the auto-measured value + `suffix` (e.g. "R" / an angle's degree sign).
+std::string formatDimensionText(const DRW_Dimension &dim, double measured, const std::string &prefix,
+                                 const std::string &suffix) {
+    const std::string autoText = prefix + formatDimensionMeasurement(measured) + suffix;
+    const std::string override = dim.getText();
+    if (override.empty() || override == "<>") return autoText;
+    const size_t pos = override.find("<>");
+    if (pos == std::string::npos) return override;
+    std::string result = override;
+    result.replace(pos, 2, autoText);
+    return result;
+}
+
+double normalizeAngle2Pi(double a) {
+    while (a < 0.0) a += 2.0 * M_PI;
+    while (a >= 2.0 * M_PI) a -= 2.0 * M_PI;
+    return a;
+}
+
+// A dimension line's direction is only meaningful up to +/- pi -- the line
+// itself looks identical whichever of its two definition points a file
+// happened to store as "first" -- so rendering dimension text at that raw
+// angle would render it upside-down (reads as mirrored) whenever the
+// backing entity's points were stored back-to-front relative to a
+// left-to-right reading of theta. Flips by pi whenever the raw angle falls
+// in the "upside-down" half, leaving it in (-pi/2, pi/2].
+double uprightTextAngle(double angleRad) {
+    double a = normalizeAngle2Pi(angleRad); // [0, 2*pi)
+    if (a > M_PI / 2.0 && a < 3.0 * M_PI / 2.0) a -= M_PI;
+    return a;
+}
+
+// Picks which of the two possible CCW sweeps between dir1/dir2 (both
+// measured from the same vertex) actually contains `throughAngle` -- the
+// raw direction values alone don't say whether the dimension spans the
+// "short way" or "long way" around; the dimension's own arc-location point
+// (`throughAngle`) is what disambiguates it.
+void resolveAngularSweep(double dir1, double dir2, double throughAngle, double &start, double &end) {
+    const double sweep1 = normalizeAngle2Pi(dir2 - dir1); // CCW sweep from dir1 to dir2
+    const double rel = normalizeAngle2Pi(throughAngle - dir1);
+    if (rel <= sweep1) {
+        start = dir1;
+        end = dir1 + sweep1;
+    } else {
+        start = dir2;
+        end = dir2 + (2.0 * M_PI - sweep1);
+    }
+}
+
+// Reads one numeric DIMSTYLE override from an entity's XDATA -- AutoCAD's
+// mechanism for overriding specific dimension variables on a single
+// dimension without a full named DIMSTYLE (visible in DXF as an "ACAD"/
+// "DSTYLE" extended-data group: 1001 "ACAD", 1000 "DSTYLE", 1002 "{", then
+// (1070 dimvar-group-code)/(1040 value) pairs, 1002 "}"). `dimVarCode` is
+// the DIMSTYLE group code identifying which variable (40=dimscale,
+// 41=dimasz, 42=dimexo, 44=dimexe, 140=dimtxt) -- all double-valued, hence
+// only handling a 1040-coded value here. A pair naming some other
+// variable (e.g. 340, a text-style handle) is simply skipped, not
+// misread, since the search is keyed on the group code, not position.
+bool findDstyleXdataOverride(const std::vector<std::shared_ptr<DRW_Variant>> &extData, int dimVarCode, double &out) {
+    for (size_t i = 0; i + 1 < extData.size(); ++i) {
+        const DRW_Variant *appName = extData[i].get();
+        if (!appName || appName->code() != 1001 || appName->type() != DRW_Variant::STRING) continue;
+        if (std::string(appName->c_str()) != "ACAD") continue;
+        const DRW_Variant *marker = extData[i + 1].get();
+        if (!marker || marker->code() != 1000 || marker->type() != DRW_Variant::STRING) continue;
+        if (std::string(marker->c_str()) != "DSTYLE") continue;
+
+        for (size_t j = i + 2; j + 1 < extData.size(); ++j) {
+            const DRW_Variant *v = extData[j].get();
+            if (!v) continue;
+            if (v->code() == 1002 && v->type() == DRW_Variant::STRING && std::string(v->c_str()) == "}") break;
+            if (v->code() != 1070 || v->type() != DRW_Variant::INTEGER || v->i_val() != dimVarCode) continue;
+            const DRW_Variant *value = extData[j + 1].get();
+            if (value && value->code() == 1040 && value->type() == DRW_Variant::DOUBLE) {
+                out = value->d_val();
+                return true;
+            }
+        }
+        return false; // found the DSTYLE group but not this specific override
+    }
+    return false;
 }
 } // namespace
+
+DwgDocument::DimStyleDefaults DwgDocument::uniformFallbackDimStyle(double referenceLength) {
+    if (cachedDimFallbackArrowSize_ < 0.0) {
+        cachedDimFallbackArrowSize_ = std::max(referenceLength, 1e-6) * 0.03;
+    }
+    const double arrow = cachedDimFallbackArrowSize_;
+    return {arrow, arrow * 0.25, arrow * 0.7, arrow * 1.1};
+}
+
+DwgDocument::DimStyleDefaults DwgDocument::resolveDimStyle(const DRW_Dimension &dim, double referenceLength) {
+    auto it = dimStyles_.find(dim.getStyle());
+    if (it == dimStyles_.end()) it = dimStyles_.find("Standard");
+
+    DimStyleDefaults style;
+    bool trustworthy;
+    if (it != dimStyles_.end()) {
+        style = it->second;
+        // Bit-for-bit DRW_Dimstyle::reset()'s literal factory-default
+        // values -- the signature DRW_Dimstyle::parseDwg (DWG only) leaves
+        // behind by skipping these fields entirely, not a real file
+        // coincidentally wanting all four at once (see resolveDimStyle's
+        // declaration comment).
+        const bool looksUnparsed = style.arrowSize == 0.18 && style.extOffset == 0.0625 &&
+                                    style.extExtend == 0.18 && style.textHeight == 0.18;
+        if (looksUnparsed && hasReliableDimHeaderVars_) {
+            // The named style's own fields weren't really parsed, but the
+            // header's $DIM* values ARE reliable here (DRW_Header::parseDwg
+            // -- drw_header.cpp -- does populate these for DWG, unlike the
+            // DIMSTYLE table): use those instead of the table's bogus
+            // defaults, not the defaults themselves. Previously this branch
+            // only decided *whether* to trust the result, still returning
+            // the unparsed 0.18 table value even when reliable header data
+            // was sitting right there to use instead -- arrows (and text,
+            // whenever no XDATA override supplied a real dimtxt) came out
+            // sized for a 0.18-unit-scale drawing regardless of the actual
+            // one.
+            style = {dimArrowSize_, dimExtOffset_, dimExtExtend_, dimTextHeight_};
+        }
+        trustworthy = !looksUnparsed || hasReliableDimHeaderVars_;
+    } else {
+        style = {dimArrowSize_, dimExtOffset_, dimExtExtend_, dimTextHeight_};
+        trustworthy = hasReliableDimHeaderVars_;
+    }
+
+    if (!trustworthy) return uniformFallbackDimStyle(referenceLength);
+
+    // A per-entity XDATA override (see findDstyleXdataOverride) replaces
+    // the corresponding raw component before $DIMSCALE is applied --
+    // AutoCAD's own precedence (most specific to this one dimension wins).
+    double effectiveScale = dimScale_;
+    findDstyleXdataOverride(dim.extData, 40, effectiveScale);
+    findDstyleXdataOverride(dim.extData, 41, style.arrowSize);
+    findDstyleXdataOverride(dim.extData, 42, style.extOffset);
+    findDstyleXdataOverride(dim.extData, 44, style.extExtend);
+    findDstyleXdataOverride(dim.extData, 140, style.textHeight);
+
+    // $DIMSCALE (or this entity's own XDATA override of it) applies on top
+    // of whichever style is in effect -- see the declaration comment for
+    // why this isn't folded into dimStyles_/the header-fallback members
+    // themselves.
+    style.arrowSize *= effectiveScale;
+    style.extOffset *= effectiveScale;
+    style.extExtend *= effectiveScale;
+    style.textHeight *= effectiveScale;
+    return style;
+}
+
+void DwgDocument::addDimStyle(const DRW_Dimstyle &data) {
+    dimStyles_[data.name] = {data.dimasz, data.dimexo, data.dimexe, data.dimtxt};
+}
+
+void DwgDocument::addDimensionArrow(Point2D tip, double dirAngleRad, double arrowSize, const RgbColor &color) {
+    constexpr double kHalfAngle = 0.165; // radians (~9.46 degrees) -- standard arrowhead proportions
+    const double side = arrowSize / std::cos(kHalfAngle);
+    Shape s;
+    s.kind = ShapeKind::Hatch;
+    s.hatchFillKind = Shape::HatchFillKind::Solid;
+    s.color = color;
+    HatchLoop loop;
+    loop.points.push_back(tip);
+    // Back corners are offset from `tip` *toward* dirAngleRad (the
+    // direction from tip toward the rest of the dimension/leader line),
+    // not away from it -- the tip is the single point that touches the
+    // measured location, and the wide base sits inside the dimension
+    // line's span, overlapping it, the way every CAD dimension arrowhead
+    // is drawn. Flipping this sign (as an earlier version of this
+    // function did) still puts the tip in the right place -- the bug was
+    // invisible on an arrow that's small relative to a long dimension line
+    // -- but the base then pokes out past the measured point instead of
+    // into the line, which becomes obvious wherever the arrow is a
+    // significant fraction of the line's length, or another dimension's
+    // own reference line sits right where the base incorrectly lands.
+    loop.points.push_back({tip.x + side * std::cos(dirAngleRad + kHalfAngle),
+                            tip.y + side * std::sin(dirAngleRad + kHalfAngle)});
+    loop.points.push_back({tip.x + side * std::cos(dirAngleRad - kHalfAngle),
+                            tip.y + side * std::sin(dirAngleRad - kHalfAngle)});
+    s.hatchLoops.push_back(std::move(loop));
+    addShape(std::move(s));
+}
+
+void DwgDocument::addDimensionLine(Point2D p1, Point2D p2, const RgbColor &color) {
+    Shape s;
+    s.kind = ShapeKind::Line;
+    s.points = {p1, p2};
+    s.color = color;
+    addShape(std::move(s));
+}
+
+void DwgDocument::addDimensionArcShape(Point2D center, double radius, double startRad, double endRad,
+                                        const RgbColor &color) {
+    Shape s;
+    s.kind = ShapeKind::Arc;
+    s.center = center;
+    s.radius = radius;
+    s.startAngleRad = startRad;
+    s.endAngleRad = endRad;
+    s.color = color;
+    addShape(std::move(s));
+}
+
+void DwgDocument::addDimensionText(Point2D anchor, double angleRad, double textHeight, const std::string &text,
+                                    const RgbColor &color) {
+    if (text.empty()) return;
+    Shape s;
+    s.kind = ShapeKind::Text;
+    s.text = text;
+    s.center = anchor;
+    s.textAngleRad = angleRad;
+    s.textHeightDoc = textHeight;
+    s.textHAlign = TextHAlign::Center;
+    s.textVAlign = TextVAlign::Middle;
+    s.color = color;
+    addShape(std::move(s));
+}
+
+void DwgDocument::addLinearStyleDimension(const DRW_Dimension &dim, Point2D p1, Point2D p2, Point2D dimLinePt,
+                                           double thetaRad) {
+    const double dirX = std::cos(thetaRad), dirY = std::sin(thetaRad);
+    const double normX = -dirY, normY = dirX;
+
+    // The dimension line is the infinite line through dimLinePt in
+    // direction theta; foot1/foot2 are p1/p2 *projected* onto it (not
+    // translated by a shared offset -- that only happens to stay parallel
+    // to theta when p2-p1 is already parallel to theta, true for an
+    // Aligned dimension but NOT for a Linear/rotated one, where theta is
+    // an independently-specified angle: a "horizontal" or "vertical"
+    // DIMLINEAR measuring two points at different heights/offsets would
+    // otherwise come out as a skewed line matching the p1-p2 direction
+    // instead of a true horizontal/vertical one).
+    const double s1 = (p1.x - dimLinePt.x) * dirX + (p1.y - dimLinePt.y) * dirY;
+    const double s2 = (p2.x - dimLinePt.x) * dirX + (p2.y - dimLinePt.y) * dirY;
+    const Point2D foot1{dimLinePt.x + s1 * dirX, dimLinePt.y + s1 * dirY};
+    const Point2D foot2{dimLinePt.x + s2 * dirX, dimLinePt.y + s2 * dirY};
+    const double measure = std::abs(s2 - s1);
+    const DimStyleDefaults style = resolveDimStyle(dim, measure);
+    const RgbColor color = resolveEntityColor(dim);
+
+    // Each extension line's own perpendicular offset from the dimension
+    // line -- computed per-point (not shared) since p1/p2 need not be
+    // equidistant from it.
+    const double t1 = (p1.x - dimLinePt.x) * normX + (p1.y - dimLinePt.y) * normY;
+    const double t2 = (p2.x - dimLinePt.x) * normX + (p2.y - dimLinePt.y) * normY;
+    const double extSign1 = (t1 <= 0.0) ? 1.0 : -1.0;
+    const double extSign2 = (t2 <= 0.0) ? 1.0 : -1.0;
+
+    addDimensionLine(foot1, foot2, color);
+    addDimensionLine({p1.x + normX * extSign1 * style.extOffset, p1.y + normY * extSign1 * style.extOffset},
+                      {foot1.x + normX * extSign1 * style.extExtend, foot1.y + normY * extSign1 * style.extExtend},
+                      color);
+    addDimensionLine({p2.x + normX * extSign2 * style.extOffset, p2.y + normY * extSign2 * style.extOffset},
+                      {foot2.x + normX * extSign2 * style.extExtend, foot2.y + normY * extSign2 * style.extExtend},
+                      color);
+
+    // Default (unflipped): each arrow's tip sits at its own foot, pointing
+    // inward along the dimension line toward the other foot -- which of
+    // thetaRad/thetaRad+pi that is depends on whether foot2 or foot1 is
+    // further along theta (s2 vs s1), NOT a fixed assignment: for an
+    // Aligned dimension theta is defined as the p1->p2 direction, so foot2
+    // is always the one further along it (s2>=s1 always) and a fixed
+    // assignment happens to work -- but for a Linear/rotated dimension
+    // theta is independently specified, so def1 can land on either side of
+    // dimLinePt (this file has real examples of both). Getting this
+    // backwards for one foot doesn't move its tip -- the tip is still
+    // exactly at that foot -- but its body then extends away from the
+    // other foot instead of toward it, i.e. outside the dimension line
+    // instead of inside it.
+    const bool foot2Ahead = s2 >= s1;
+    const double foot1Inward = foot2Ahead ? thetaRad : thetaRad + M_PI;
+    const double foot2Inward = foot2Ahead ? thetaRad + M_PI : thetaRad;
+    addDimensionArrow(foot1, dim.getFlipArrow1() ? foot1Inward + M_PI : foot1Inward, style.arrowSize, color);
+    addDimensionArrow(foot2, dim.getFlipArrow2() ? foot2Inward + M_PI : foot2Inward, style.arrowSize, color);
+
+    const Point2D textAnchor{dim.getTextPoint().x, dim.getTextPoint().y};
+    // Upright, not literally theta: theta is only defined up to +/- pi (a
+    // dimension line reads the same whichever end p1/p2 happens to be), so
+    // using it as-is would render the text upside-down (looking mirrored)
+    // whenever def1/def2 happened to be stored "backwards" relative to a
+    // left-to-right reading of theta.
+    addDimensionText(textAnchor, uprightTextAngle(thetaRad), style.textHeight,
+                      formatDimensionText(dim, measure, "", ""), color);
+}
+
+void DwgDocument::addAngularStyleDimension(const DRW_Dimension &dim, Point2D vertex, Point2D edgePoint1,
+                                            Point2D edgePoint2, Point2D radiusThroughPoint) {
+    const double radius = std::hypot(radiusThroughPoint.x - vertex.x, radiusThroughPoint.y - vertex.y);
+    if (radius < 1e-9) return; // degenerate -- arc-location point sits on the vertex itself
+
+    const DimStyleDefaults style = resolveDimStyle(dim, radius);
+    const double dir1 = std::atan2(edgePoint1.y - vertex.y, edgePoint1.x - vertex.x);
+    const double dir2 = std::atan2(edgePoint2.y - vertex.y, edgePoint2.x - vertex.x);
+    const double throughAngle = std::atan2(radiusThroughPoint.y - vertex.y, radiusThroughPoint.x - vertex.x);
+    double start = 0.0, end = 0.0;
+    resolveAngularSweep(dir1, dir2, throughAngle, start, end);
+
+    const RgbColor color = resolveEntityColor(dim);
+    addDimensionArcShape(vertex, radius, start, end, color);
+
+    // Extension lines run from the edge's own definition point out past the
+    // arc, along that same ray from the vertex -- an approximation (real
+    // AutoCAD leaves a small gap near the vertex rather than using the
+    // definition point directly), but a defensible one since that point is
+    // itself a real point on the measured edge.
+    auto extensionLine = [&](Point2D edgePoint, double dirAngle) {
+        const Point2D outer{vertex.x + std::cos(dirAngle) * (radius + style.extExtend),
+                             vertex.y + std::sin(dirAngle) * (radius + style.extExtend)};
+        addDimensionLine(edgePoint, outer, color);
+    };
+    extensionLine(edgePoint1, dir1);
+    extensionLine(edgePoint2, dir2);
+
+    // Arrow tangent direction points "into" the swept arc: +90 degrees from
+    // this ray if it's the sweep's start (increasing angle goes into the
+    // arc), -90 degrees if it's the end (decreasing angle goes into the
+    // arc).
+    auto arrowAt = [&](double dirAngle, bool flip) {
+        const Point2D pt{vertex.x + radius * std::cos(dirAngle), vertex.y + radius * std::sin(dirAngle)};
+        const bool isStart = std::abs(normalizeAngle2Pi(dirAngle - start)) < 1e-6;
+        const double intoArc = isStart ? dirAngle + M_PI / 2.0 : dirAngle - M_PI / 2.0;
+        addDimensionArrow(pt, flip ? intoArc + M_PI : intoArc, style.arrowSize, color);
+    };
+    arrowAt(dir1, dim.getFlipArrow1());
+    arrowAt(dir2, dim.getFlipArrow2());
+
+    const Point2D textAnchor{dim.getTextPoint().x, dim.getTextPoint().y};
+    const double measureDeg = (end - start) * 180.0 / M_PI;
+    addDimensionText(textAnchor, 0.0, style.textHeight, formatDimensionText(dim, measureDeg, "", "\xC2\xB0"), color);
+}
+
+void DwgDocument::addDimAlign(const DRW_DimAligned *data) {
+    if (!data) return;
+    const Point2D p1{data->getDef1Point().x, data->getDef1Point().y};
+    const Point2D p2{data->getDef2Point().x, data->getDef2Point().y};
+    const Point2D dimLinePt{data->getDimPoint().x, data->getDimPoint().y};
+    const double theta = std::atan2(p2.y - p1.y, p2.x - p1.x);
+    addLinearStyleDimension(*data, p1, p2, dimLinePt, theta);
+}
+
+void DwgDocument::addDimLinear(const DRW_DimLinear *data) {
+    if (!data) return;
+    const Point2D p1{data->getDef1Point().x, data->getDef1Point().y};
+    const Point2D p2{data->getDef2Point().x, data->getDef2Point().y};
+    const Point2D dimLinePt{data->getDimPoint().x, data->getDimPoint().y};
+    const double theta = data->getAngle() * M_PI / 180.0;
+    addLinearStyleDimension(*data, p1, p2, dimLinePt, theta);
+}
+
+void DwgDocument::addDimRadial(const DRW_DimRadial *data) {
+    if (!data) return;
+    const Point2D center{data->getCenterPoint().x, data->getCenterPoint().y};
+    const Point2D onCircle{data->getDiameterPoint().x, data->getDiameterPoint().y};
+    const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
+    const double measure = std::hypot(onCircle.x - center.x, onCircle.y - center.y);
+    const RgbColor color = resolveEntityColor(*data);
+    const DimStyleDefaults style = resolveDimStyle(*data, measure);
+
+    addDimensionLine(onCircle, textAnchor, color);
+    double dirAngle = std::atan2(textAnchor.y - onCircle.y, textAnchor.x - onCircle.x);
+    if (data->getFlipArrow1()) dirAngle += M_PI;
+    addDimensionArrow(onCircle, dirAngle, style.arrowSize, color);
+    addDimensionText(textAnchor, 0.0, style.textHeight, formatDimensionText(*data, measure, "R", ""), color);
+}
+
+void DwgDocument::addDimDiametric(const DRW_DimDiametric *data) {
+    if (!data) return;
+    const Point2D p1{data->getDiameter1Point().x, data->getDiameter1Point().y};
+    const Point2D p2{data->getDiameter2Point().x, data->getDiameter2Point().y};
+    const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
+    const double measure = std::hypot(p2.x - p1.x, p2.y - p1.y);
+    const RgbColor color = resolveEntityColor(*data);
+    const DimStyleDefaults style = resolveDimStyle(*data, measure);
+
+    addDimensionLine(p1, textAnchor, color);
+    double dirAngle = std::atan2(textAnchor.y - p1.y, textAnchor.x - p1.x);
+    if (data->getFlipArrow1()) dirAngle += M_PI;
+    addDimensionArrow(p1, dirAngle, style.arrowSize, color);
+    addDimensionText(textAnchor, 0.0, style.textHeight, formatDimensionText(*data, measure, "\xC3\x98", ""), color);
+}
+
+void DwgDocument::addDimAngular(const DRW_DimAngular *data) {
+    if (!data) return;
+    const Point2D p1a{data->getFirstLine1().x, data->getFirstLine1().y};
+    const Point2D p1b{data->getFirstLine2().x, data->getFirstLine2().y};
+    const Point2D p2a{data->getSecondLine1().x, data->getSecondLine1().y};
+    const Point2D p2b{data->getSecondLine2().x, data->getSecondLine2().y};
+
+    // Vertex = intersection of line (p1a,p1b) and line (p2a,p2b).
+    const double denom = (p1b.x - p1a.x) * (p2b.y - p2a.y) - (p1b.y - p1a.y) * (p2b.x - p2a.x);
+    if (std::abs(denom) < 1e-9) return; // parallel edges -- no well-defined vertex
+    const double s = ((p2a.x - p1a.x) * (p2b.y - p2a.y) - (p2a.y - p1a.y) * (p2b.x - p2a.x)) / denom;
+    const Point2D vertex{p1a.x + s * (p1b.x - p1a.x), p1a.y + s * (p1b.y - p1a.y)};
+
+    addAngularStyleDimension(*data, vertex, p1b, p2b, {data->getDimPoint().x, data->getDimPoint().y});
+}
+
+void DwgDocument::addDimAngular3P(const DRW_DimAngular3p *data) {
+    if (!data) return;
+    const Point2D vertex{data->getVertexPoint().x, data->getVertexPoint().y};
+    const Point2D p1{data->getFirstLine().x, data->getFirstLine().y};
+    const Point2D p2{data->getSecondLine().x, data->getSecondLine().y};
+    const Point2D throughPt{data->getDimPoint().x, data->getDimPoint().y};
+    addAngularStyleDimension(*data, vertex, p1, p2, throughPt);
+}
 
 void DwgDocument::addLWPolyline(const DRW_LWPolyline &data) {
     Shape s;
@@ -629,6 +1241,14 @@ bool DwgDocument::loadFile(const std::string &path) {
     layerLineTypes_.clear();
     linePatterns_.clear();
     globalLtScale_ = 1.0;
+    dimArrowSize_ = 0.18;
+    dimExtOffset_ = 0.0625;
+    dimExtExtend_ = 0.18;
+    dimTextHeight_ = 0.18;
+    dimScale_ = 1.0;
+    hasReliableDimHeaderVars_ = false;
+    cachedDimFallbackArrowSize_ = -1.0;
+    dimStyles_.clear();
     blocks_.clear();
     topLevelInserts_.clear();
     insideBlock_ = false;

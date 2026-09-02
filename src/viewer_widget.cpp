@@ -1,8 +1,10 @@
 #include "viewer_widget.h"
 
+#include <QBrush>
 #include <QColor>
 #include <QFont>
 #include <QFontMetricsF>
+#include <QLinearGradient>
 #include <QLineF>
 #include <QPainter>
 #include <QPainterPath>
@@ -12,6 +14,8 @@
 #include <QResizeEvent>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace {
 // Converts a DXF/DWG polyline vertex "bulge" (tan(includedAngle/4), signed:
@@ -129,6 +133,139 @@ void drawStroke(QPainter &painter, const std::vector<QPointF> &pts, bool closed,
                 patternIdx = (patternIdx + 1) % dashPattern.size();
                 remaining = dashPattern[patternIdx];
                 on = !on;
+            }
+        }
+    }
+    painter.drawPath(path);
+}
+
+// Samples one HatchLoop into a closed point ring, reusing the same
+// bulge->arc sampling as the Polyline case (a hatch loop is the same
+// points+bulges representation, just always implicitly closed).
+std::vector<QPointF> sampleHatchLoop(const HatchLoop &loop) {
+    const size_t n = loop.points.size();
+    std::vector<QPointF> pts;
+    if (n < 2) return pts;
+    const bool hasBulges = loop.bulges.size() == n;
+    pts.reserve(n);
+    pts.emplace_back(loop.points[0].x, loop.points[0].y);
+    for (size_t i = 1; i < n; ++i) {
+        sampleSegmentPoints(pts, QPointF(loop.points[i - 1].x, loop.points[i - 1].y),
+                            QPointF(loop.points[i].x, loop.points[i].y),
+                            hasBulges ? loop.bulges[i - 1] : 0.0);
+    }
+    sampleSegmentPoints(pts, QPointF(loop.points[n - 1].x, loop.points[n - 1].y),
+                        QPointF(loop.points[0].x, loop.points[0].y),
+                        hasBulges ? loop.bulges[n - 1] : 0.0);
+    return pts;
+}
+
+// Builds the filled region for a hatch: the union of all its boundary
+// loops under an even-odd fill rule, so an island loop automatically reads
+// as a hole regardless of which winding direction either loop happens to
+// use -- AutoCAD/LibreCAD don't guarantee loop winding for HATCH boundary
+// data the way a well-formed nonzero-rule polygon set would need.
+QPainterPath buildHatchPath(const Shape &s) {
+    QPainterPath path;
+    path.setFillRule(Qt::OddEvenFill);
+    for (const HatchLoop &loop : s.hatchLoops) {
+        const std::vector<QPointF> pts = sampleHatchLoop(loop);
+        if (pts.size() < 2) continue;
+        QPainterPath sub;
+        sub.moveTo(pts[0]);
+        for (size_t i = 1; i < pts.size(); ++i) sub.lineTo(pts[i]);
+        sub.closeSubpath();
+        path.addPath(sub);
+    }
+    return path;
+}
+
+// Draws one HATCH pattern definition line's full family of repeats
+// (base point + k*offset, for every k whose line crosses `bounds`) as
+// infinite-looking rays -- actual visibility is left entirely to the
+// caller's clip (see the Pattern case in ViewerWidget::paintEvent), so
+// this only needs to reach past `bounds` in both directions, not compute
+// exact polygon intersections itself.
+void drawHatchPatternLine(QPainter &painter, const HatchPatternLine &pl, const QRectF &bounds) {
+    const QPointF dir(std::cos(pl.angleRad), std::sin(pl.angleRad));
+    const QPointF perp(-dir.y(), dir.x());
+    const QPointF base(pl.basePoint.x, pl.basePoint.y);
+    const QPointF offset(pl.offset.x, pl.offset.y);
+
+    // Decompose the repeat offset into perpendicular pitch (which row a
+    // repeat lands on) and along-line phase shift (dash-pattern stagger
+    // between rows) -- both are dot products against the unit dir/perp
+    // axes above.
+    const double spacing = QPointF::dotProduct(offset, perp);
+    const double phaseShift = QPointF::dotProduct(offset, dir);
+    if (std::abs(spacing) < 1e-9) return; // degenerate pattern data -- nothing sane to repeat
+
+    const QPointF corners[4] = {bounds.topLeft(), bounds.topRight(), bounds.bottomLeft(), bounds.bottomRight()};
+    double minPerp = std::numeric_limits<double>::max(), maxPerp = std::numeric_limits<double>::lowest();
+    double minAlong = std::numeric_limits<double>::max(), maxAlong = std::numeric_limits<double>::lowest();
+    for (const QPointF &c : corners) {
+        const QPointF rel = c - base;
+        minPerp = std::min(minPerp, QPointF::dotProduct(rel, perp));
+        maxPerp = std::max(maxPerp, QPointF::dotProduct(rel, perp));
+        minAlong = std::min(minAlong, QPointF::dotProduct(rel, dir));
+        maxAlong = std::max(maxAlong, QPointF::dotProduct(rel, dir));
+    }
+
+    int kMin = static_cast<int>(std::floor(minPerp / spacing)) - 1;
+    int kMax = static_cast<int>(std::ceil(maxPerp / spacing)) + 1;
+    if (kMin > kMax) std::swap(kMin, kMax);
+    if (static_cast<std::int64_t>(kMax) - kMin > 100000) return; // corrupt/degenerate spacing -- bail rather than hang
+
+    // Raw DXF code-49 values: positive=dash, negative=gap, 0=dot (sized
+    // relative to the pattern's own total length, same reasoning as
+    // DwgDocument::resolveEntityLineType's dotLen).
+    double patternTotal = 0.0;
+    for (double d : pl.dashPattern) patternTotal += std::abs(d);
+    const double dotLen = std::max(patternTotal * 0.02, 1e-6);
+
+    QPainterPath path;
+    for (int k = kMin; k <= kMax; ++k) {
+        const QPointF rowBase = base + perp * (k * spacing);
+        const QPointF p0 = rowBase + dir * minAlong;
+        const QPointF p1 = rowBase + dir * maxAlong;
+        const double segLen = maxAlong - minAlong;
+        if (segLen <= 1e-9) continue;
+
+        if (pl.dashPattern.empty()) {
+            path.moveTo(p0);
+            path.lineTo(p1);
+            continue;
+        }
+
+        // Phase: distance from p0 to this row's own base point (base +
+        // k*offset), projected along dir, wrapped into [0, patternTotal).
+        const double rowBaseAlong = k * phaseShift; // relative to `base`'s own along-position
+        double phase = std::fmod(minAlong - rowBaseAlong, patternTotal);
+        if (phase < 0.0) phase += patternTotal;
+
+        size_t idx = 0;
+        double acc = 0.0;
+        for (; idx + 1 < pl.dashPattern.size(); ++idx) {
+            const double len = pl.dashPattern[idx] == 0.0 ? dotLen : std::abs(pl.dashPattern[idx]);
+            if (phase < acc + len) break;
+            acc += len;
+        }
+        double remaining = acc + (pl.dashPattern[idx] == 0.0 ? dotLen : std::abs(pl.dashPattern[idx])) - phase;
+        bool on = pl.dashPattern[idx] >= 0.0;
+
+        double pos = 0.0;
+        while (pos < segLen) {
+            const double step = std::min(remaining, segLen - pos);
+            if (on) {
+                path.moveTo(p0 + dir * pos);
+                path.lineTo(p0 + dir * (pos + step));
+            }
+            pos += step;
+            remaining -= step;
+            if (remaining <= 1e-9) {
+                idx = (idx + 1) % pl.dashPattern.size();
+                remaining = pl.dashPattern[idx] == 0.0 ? dotLen : std::abs(pl.dashPattern[idx]);
+                on = pl.dashPattern[idx] >= 0.0;
             }
         }
     }
@@ -334,6 +471,43 @@ void ViewerWidget::paintEvent(QPaintEvent *) {
                     y += linePitch;
                 }
                 painter.restore();
+                break;
+            }
+            case ShapeKind::Hatch: {
+                if (s.hatchLoops.empty()) break;
+                const QPainterPath path = buildHatchPath(s);
+                if (path.isEmpty()) break;
+
+                switch (s.hatchFillKind) {
+                    case Shape::HatchFillKind::Solid:
+                        painter.fillPath(path, QColor(s.color.r, s.color.g, s.color.b));
+                        break;
+                    case Shape::HatchFillKind::Gradient: {
+                        const QRectF bounds = path.boundingRect();
+                        const double halfDiag = 0.5 * std::hypot(bounds.width(), bounds.height());
+                        if (halfDiag < 1e-9) {
+                            painter.fillPath(path, QColor(s.color.r, s.color.g, s.color.b));
+                            break;
+                        }
+                        const QPointF center = bounds.center();
+                        const QPointF dir(std::cos(s.hatchGradientAngleRad), std::sin(s.hatchGradientAngleRad));
+                        QLinearGradient grad(center - dir * halfDiag, center + dir * halfDiag);
+                        grad.setColorAt(0.0, QColor(s.color.r, s.color.g, s.color.b));
+                        grad.setColorAt(1.0, QColor(s.hatchColor2.r, s.hatchColor2.g, s.hatchColor2.b));
+                        painter.fillPath(path, QBrush(grad));
+                        break;
+                    }
+                    case Shape::HatchFillKind::Pattern: {
+                        painter.save();
+                        painter.setClipPath(path, Qt::IntersectClip);
+                        const QRectF bounds = path.boundingRect();
+                        for (const HatchPatternLine &pl : s.hatchPatternLines) {
+                            drawHatchPatternLine(painter, pl, bounds);
+                        }
+                        painter.restore();
+                        break;
+                    }
+                }
                 break;
             }
         }
