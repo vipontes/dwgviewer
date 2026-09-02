@@ -54,11 +54,54 @@ sample_data/basic.dxf    small hand-written DXF used to sanity-check the
 
 ## Building
 
+### Linux
+
+Install the toolchain, then configure and build:
+
 ```bash
 sudo apt install cmake qt6-base-dev g++
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
+```
+
+The executable is `build/dwgviewer`.
+
+### Windows
+
+**Prerequisites:**
+
+- **Visual Studio 2022** (Community or higher) with the "Desktop development
+  with C++" workload, for the MSVC toolchain.
+- **Qt 6**, MSVC build — install via the
+  [Qt Online Installer](https://www.qt.io/download-qt-installer) and select
+  an `msvc2022_64` kit (not `mingw_64` — it must match VS's ABI). This
+  project has been built and tested against Qt 6.11.2.
+- **CMake** (3.16+) — bundled with the Qt Online Installer's "Developer and
+  Designer Tools", or install standalone.
+
+**Configure and build**, from a regular PowerShell/Command Prompt (adjust
+the Qt path/version to match your install):
+
+```powershell
+mkdir build
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="C:/Qt/6.11.2/msvc2022_64"
+cmake --build build --config Release
+```
+
+This generates `build\dwgviewer_prototype.sln`, which can also be opened
+directly in Visual Studio for building/debugging instead of using
+`cmake --build`.
+
+The executable is `build\Release\dwgviewer.exe` (or `build\Debug\...` for a
+Debug config).
+
+Running it outside Visual Studio requires Qt's DLLs to be reachable — either
+add `C:\Qt\6.11.2\msvc2022_64\bin` to `PATH`, or copy the needed DLLs
+alongside the exe with:
+
+```powershell
+C:\Qt\6.11.2\msvc2022_64\bin\windeployqt.exe build\Release\dwgviewer.exe
 ```
 
 ## Running
@@ -68,6 +111,9 @@ make -j$(nproc)
 ./dwgviewer path/to/file.dwg                 # same code path, DWG instead
 ./dwgviewer file.dxf --png out.png 800x600   # headless, writes a PNG
 ```
+
+On Windows, run `.\dwgviewer.exe` (from `build\Release\`) with the same
+arguments.
 
 Left-drag to pan, mouse wheel to zoom (around the cursor).
 
