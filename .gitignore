@@ -39,3 +39,10 @@ Thumbs.db
 # Generated test/debug output
 *.png
 !sample_data/**/*.png
+
+
+roundtrip_out.dxf
+roundtrip_out.dwg
+
+read_test
+write_test
