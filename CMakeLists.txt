@@ -26,7 +26,17 @@ target_include_directories(dxfrw PUBLIC
 )
 
 # --- Qt -------------------------------------------------------------------
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+# Prefer Qt6, but fall back to Qt5 -- needed for 32-bit Windows builds,
+# since Qt6's official installer only ships 64-bit Windows kits. The
+# Widgets API this project uses (QWidget/QPainter/QMainWindow/event
+# classes) is source-compatible across both major versions.
+find_package(Qt6 QUIET COMPONENTS Widgets)
+if(Qt6_FOUND)
+    set(QT_WIDGETS_TARGET Qt6::Widgets)
+else()
+    find_package(Qt5 5.15 REQUIRED COMPONENTS Widgets)
+    set(QT_WIDGETS_TARGET Qt5::Widgets)
+endif()
 
 add_executable(dwgviewer
     src/main.cpp
@@ -35,7 +45,7 @@ add_executable(dwgviewer
     src/viewer_widget.cpp
     src/viewer_widget.h
 )
-target_link_libraries(dwgviewer PRIVATE Qt6::Widgets dxfrw)
+target_link_libraries(dwgviewer PRIVATE ${QT_WIDGETS_TARGET} dxfrw)
 
 if(WIN32)
     # Default MSVC subsystem is Console, which pops a console window

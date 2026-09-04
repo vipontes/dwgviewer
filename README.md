@@ -72,16 +72,27 @@ The executable is `build/dwgviewer`.
 **Prerequisites:**
 
 - **Visual Studio 2022** (Community or higher) with the "Desktop development
-  with C++" workload, for the MSVC toolchain.
-- **Qt 6**, MSVC build — install via the
-  [Qt Online Installer](https://www.qt.io/download-qt-installer) and select
-  an `msvc2022_64` kit (not `mingw_64` — it must match VS's ABI). This
-  project has been built and tested against Qt 6.11.2.
+  with C++" workload, for the MSVC toolchain. For a 32-bit build, also add
+  the "MSVC v143 - VS 2022 C++ x86 build tools" optional component (the x64
+  tools are installed by default; x86 is a separate checkbox).
+- **Qt**, MSVC build — install via the
+  [Qt Online Installer](https://www.qt.io/download-qt-installer).
+  `CMakeLists.txt` accepts either Qt6 or Qt5 (it probes for Qt6 first and
+  falls back to Qt5), so pick the kit that matches the architecture you
+  want:
+  - **64-bit:** a Qt6 `msvc2022_64` kit (not `mingw_64` — it must match
+    VS's ABI). This project has been built and tested against Qt 6.11.2.
+  - **32-bit:** Qt6 doesn't ship official 32-bit Windows kits, so use Qt5
+    instead — a Qt 5.15.2 `msvc2019` kit (no `_64` suffix; that's the
+    32-bit one). MSVC2019-built Qt5 binaries are ABI-compatible with the
+    VS 2022 toolchain, so VS 2022's x86 tools above still work.
 - **CMake** (3.16+) — bundled with the Qt Online Installer's "Developer and
   Designer Tools", or install standalone.
 
 **Configure and build**, from a regular PowerShell/Command Prompt (adjust
 the Qt path/version to match your install):
+
+64-bit, against Qt6:
 
 ```powershell
 mkdir build
@@ -89,19 +100,37 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="C:/Qt
 cmake --build build --config Release
 ```
 
-This generates `build\dwgviewer_prototype.sln`, which can also be opened
-directly in Visual Studio for building/debugging instead of using
-`cmake --build`.
-
-The executable is `build\Release\dwgviewer.exe` (or `build\Debug\...` for a
-Debug config).
-
-Running it outside Visual Studio requires Qt's DLLs to be reachable — either
-add `C:\Qt\6.11.2\msvc2022_64\bin` to `PATH`, or copy the needed DLLs
-alongside the exe with:
+32-bit, against Qt5 (note `-A Win32`, not `x64`):
 
 ```powershell
+mkdir build-x86
+cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32 -DCMAKE_PREFIX_PATH="C:/Qt/5.15.2/msvc2019"
+cmake --build build-x86 --config Release
+```
+
+`-A` picks the target architecture regardless of which Qt kit
+`CMAKE_PREFIX_PATH` points at — mixing them (e.g. `-A x64` with the 32-bit
+Qt kit) fails at the linking step with an `LNK1112`/machine-type-mismatch
+error, so keep them in sync. Use a separate build directory per
+architecture (`build` / `build-x86` above) rather than reconfiguring one
+in place, since CMake caches the architecture on first configure.
+
+Both generate a `.sln` (`build\dwgviewer_prototype.sln` /
+`build-x86\dwgviewer_prototype.sln`), which can also be opened directly in
+Visual Studio for building/debugging instead of using `cmake --build`.
+
+The executable is `build\Release\dwgviewer.exe` (or `build-x86\Release\...`
+for the 32-bit build; `...\Debug\...` for a Debug config).
+
+Running it outside Visual Studio requires Qt's DLLs to be reachable —
+either add the Qt kit's `bin` folder to `PATH`, or copy the needed DLLs
+alongside the exe with `windeployqt`:
+
+```powershell
+# 64-bit
 C:\Qt\6.11.2\msvc2022_64\bin\windeployqt.exe build\Release\dwgviewer.exe
+# 32-bit
+C:\Qt\5.15.2\msvc2019\bin\windeployqt.exe build-x86\Release\dwgviewer.exe
 ```
 
 **Distributing the exe to another machine:** `windeployqt` (above) is the
@@ -129,6 +158,14 @@ needs `vcruntime140.dll`, `vcruntime140_1.dll`, and `msvcp140.dll`. These
 come from Visual Studio, not Qt — either have the target machine install
 the [VC++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe),
 or copy those three DLLs from `C:\Windows\System32` alongside the exe.
+
+The 32-bit (`build-x86\Release\`) build needs the **x86** redistributable
+instead — [VC++ Redistributable (x86)](https://aka.ms/vs/17/release/vc_redist.x86.exe)
+— and, if copying DLLs by hand instead, `C:\Windows\SysWOW64` (not
+`System32`, which holds the 64-bit copies) on a 64-bit target machine, or
+`System32` on a 32-bit Windows machine. Everything else `windeployqt`
+copies (Qt5 DLLs and plugin subfolders instead of Qt6's, but the same
+folder layout) still applies.
 
 ## Running
 
