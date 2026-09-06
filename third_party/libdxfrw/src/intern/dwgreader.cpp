@@ -1271,12 +1271,37 @@ bool dwgReader::readDwgEntities(DRW_Interface& intfa, dwgBuffer *dbuf){
         m_entityParseFailures += failures;
     }
 
-    // Flush any INSERTs still awaiting ATTRIB children (defensive — handles
-    // missing SEQEND or ATTRIB entries that failed to parse).
-    for (auto& kv : m_pendingInserts)
+    // Reconcile ATTRIB<->INSERT ownership now that every entity in this
+    // ObjectMap sweep has been read, then dispatch every INSERT that was
+    // waiting on ATTRIB children. This has to happen only now, in a
+    // dedicated pass, rather than incrementally as INSERT/ATTRIB/SEQEND
+    // entities were encountered above: ObjectMap is a std::unordered_map,
+    // so its iteration order bears no relation to file/handle order --
+    // an ATTRIB's owning INSERT, and the SEQEND terminating that INSERT's
+    // attribute list, can each be visited before OR after the ATTRIB itself,
+    // in any combination. A version of this code that flushed an INSERT as
+    // soon as its SEQEND was seen (or as soon as an expected attribute count
+    // was reached) was flushing with a still-empty or partial attlist --
+    // confirmed against this project's own Z1-3510299.dwg, where the
+    // SEQEND for one 5-attribute INSERT was visited before any of its
+    // ATTRIBs, immediately dispatching it with zero attributes and orphaning
+    // (and then dropping) all 5. Waiting until the whole sweep is done, and
+    // only then merging orphans into their owning INSERT, is immune to
+    // iteration order entirely.
+    for (auto& kv : m_pendingInserts) {
+        auto orphIt = m_orphanAttribs.find(kv.first);
+        if (orphIt != m_orphanAttribs.end()) {
+            for (auto& a : orphIt->second)
+                kv.second.attlist.push_back(std::move(a));
+            m_orphanAttribs.erase(orphIt);
+        }
         intfa.addInsert(kv.second);
+    }
     m_pendingInserts.clear();
     if (!m_orphanAttribs.empty()) {
+        // ATTRIBs whose owner handle never matched any INSERT actually read
+        // in this file -- a malformed/hand-edited file. Nothing to attach
+        // them to.
         DRW_DBG("\nDropping orphan ATTRIB groups: "); DRW_DBG(m_orphanAttribs.size()); DRW_DBG("\n");
         m_orphanAttribs.clear();
     }
@@ -1383,13 +1408,14 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             if (localRet) {
                 a->style = findTableName(DRW::STYLE, a->styleH.ref);
                 const std::uint32_t ownerH = a->parentHandle;
+                // Just bucket it -- see the reconciliation pass at the end of
+                // readDwgEntities() for why nothing is dispatched to addInsert
+                // here (ObjectMap is an unordered_map, so an ATTRIB's owning
+                // INSERT and terminating SEQEND can be visited in literally
+                // any order relative to it and to each other).
                 auto pendIt = m_pendingInserts.find(ownerH);
                 if (pendIt != m_pendingInserts.end()) {
                     pendIt->second.attlist.push_back(a);
-                    if (pendIt->second.attlist.size() >= pendIt->second.attribHandles.size()) {
-                        intfa.addInsert(pendIt->second);
-                        m_pendingInserts.erase(pendIt);
-                    }
                 } else {
                     m_orphanAttribs[ownerH].push_back(a);
                 }
@@ -1414,6 +1440,8 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             ret = true;
             break; }
         case dwgType::SEQEND:
+            // Not a completion signal -- see the reconciliation pass at the
+            // end of readDwgEntities().
             break;
         case dwgType::INSERT:
         case dwgType::MINSERT: {
@@ -1422,17 +1450,15 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
                 e.name = findTableName(DRW::BLOCK_RECORD,
                                        e.blockRecH.ref);
 
-                auto orphIt = m_orphanAttribs.find(e.handle);
-                if (orphIt != m_orphanAttribs.end()) {
-                    for (auto& a : orphIt->second)
-                        e.attlist.push_back(std::move(a));
-                    m_orphanAttribs.erase(orphIt);
-                }
-
-                if (e.attribHandles.empty() ||
-                    e.attlist.size() >= e.attribHandles.size()) {
+                if (e.attribHandles.empty()) {
+                    // No ATTRIBs were ever recorded for this INSERT -- safe
+                    // to dispatch immediately, this is the overwhelmingly
+                    // common case (plain block references).
                     intfa.addInsert(e);
                 } else {
+                    // Deferred until the reconciliation pass at the end of
+                    // readDwgEntities() -- see that pass's comment for why
+                    // nothing is merged/dispatched here.
                     m_pendingInserts.emplace(e.handle, std::move(e));
                 }
             }

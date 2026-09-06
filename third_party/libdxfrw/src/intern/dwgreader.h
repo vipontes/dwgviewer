@@ -269,10 +269,21 @@ public:
     std::unordered_map<std::uint32_t, DRW_UCS*> ucsmap;
 
     // Buffers for ATTRIB attached-attlist routing in processDwgEntity.
-    // m_pendingInserts: INSERT entities awaiting their ATTRIB children + SEQEND
-    //                   before being dispatched to addInsert.  Keyed by INSERT handle.
-    // m_orphanAttribs:  ATTRIB entities seen before their owning INSERT.
-    //                   Keyed by parent (INSERT) handle.
+    // m_pendingInserts: INSERT entities (that have >=1 ATTRIB, per their own
+    //                   attribHandles) awaiting reconciliation with their
+    //                   ATTRIB children.  Keyed by INSERT handle.  NOT
+    //                   dispatched to addInsert incrementally as ATTRIB/
+    //                   SEQEND entities are read -- ObjectMap is an
+    //                   unordered_map, so an INSERT's ATTRIBs and its
+    //                   terminating SEQEND can be visited in any order
+    //                   relative to the INSERT and to each other. Dispatch
+    //                   happens once, in a dedicated reconciliation pass at
+    //                   the end of readDwgEntities(), after every entity in
+    //                   the sweep has been read -- see that pass's comment.
+    // m_orphanAttribs:  ATTRIB entities visited before their owning INSERT
+    //                   (or before that INSERT has even been read at all).
+    //                   Keyed by parent (INSERT) handle. Merged into their
+    //                   INSERT's attlist by the same end-of-sweep pass.
     std::unordered_map<std::uint32_t, DRW_Insert> m_pendingInserts;
     std::unordered_map<std::uint32_t, std::vector<std::shared_ptr<DRW_Attrib>>> m_orphanAttribs;
 //    std::uint32_t currBlock;
