@@ -488,6 +488,8 @@ Shape transformShape(const Shape &s, const Transform2D &t) {
     out.textHeightDoc = s.textHeightDoc * scale;
     out.textAngleRad = s.textAngleRad + rotation;
     for (double &d : out.dashPattern) d *= scale;
+    for (double &w : out.startWidths) w *= scale;
+    for (double &w : out.endWidths) w *= scale;
     if (mirrored) {
         // A mirrored insert (negative xscale/yscale) flips which way each
         // bulge segment curves.
@@ -542,6 +544,34 @@ namespace {
 bool hasAnyBulge(const std::vector<double> &bulges) {
     return std::any_of(bulges.begin(), bulges.end(),
                         [](double b) { return b != 0.0; });
+}
+
+bool hasAnyWidth(const std::vector<double> &startWidths, const std::vector<double> &endWidths) {
+    return std::any_of(startWidths.begin(), startWidths.end(), [](double w) { return w != 0.0; }) ||
+           std::any_of(endWidths.begin(), endWidths.end(), [](double w) { return w != 0.0; });
+}
+
+// Resolves one vertex's effective start/end width (DXF codes 40/41) against
+// the entity-level default ("constant width" DXF code 43 for LWPOLYLINE,
+// default start/end width for POLYLINE): a vertex that specifies neither
+// falls back to the entity default for both; a vertex with a nonzero start
+// width but no end width tapers to a *constant* width across the segment
+// (end defaults to start), matching how AutoCAD treats an omitted code 41.
+// libdxfrw has no "was this code present" flag, so a genuinely-zero width
+// vertex is indistinguishable from an omitted one -- same inherent ambiguity
+// every DXF-consuming renderer has.
+void resolveVertexWidth(double vertexStart, double vertexEnd, double defaultStart, double defaultEnd,
+                         double &outStart, double &outEnd) {
+    if (vertexStart == 0.0 && vertexEnd == 0.0) {
+        outStart = defaultStart;
+        outEnd = defaultEnd;
+    } else if (vertexEnd == 0.0) {
+        outStart = vertexStart;
+        outEnd = vertexStart;
+    } else {
+        outStart = vertexStart;
+        outEnd = vertexEnd;
+    }
 }
 
 // Builds one HatchLoop from a DRW_HatchLoop. Returns false for a loop this
@@ -1196,11 +1226,18 @@ void DwgDocument::addLWPolyline(const DRW_LWPolyline &data) {
     s.closed = (data.flags & 1) != 0;
     s.points.reserve(data.vertlist.size());
     s.bulges.reserve(data.vertlist.size());
+    s.startWidths.reserve(data.vertlist.size());
+    s.endWidths.reserve(data.vertlist.size());
     for (const auto &v : data.vertlist) {
         s.points.push_back({v->x, v->y});
         s.bulges.push_back(v->bulge);
+        double sw, ew;
+        resolveVertexWidth(v->stawidth, v->endwidth, data.width, data.width, sw, ew);
+        s.startWidths.push_back(sw);
+        s.endWidths.push_back(ew);
     }
     if (!hasAnyBulge(s.bulges)) s.bulges.clear();
+    if (!hasAnyWidth(s.startWidths, s.endWidths)) { s.startWidths.clear(); s.endWidths.clear(); }
     s.color = resolveEntityColor(data);
     s.dashPattern = resolveEntityLineType(data);
     if (!s.points.empty()) addShape(std::move(s));
@@ -1212,11 +1249,18 @@ void DwgDocument::addPolyline(const DRW_Polyline &data) {
     s.closed = (data.flags & 1) != 0;
     s.points.reserve(data.vertlist.size());
     s.bulges.reserve(data.vertlist.size());
+    s.startWidths.reserve(data.vertlist.size());
+    s.endWidths.reserve(data.vertlist.size());
     for (const auto &v : data.vertlist) {
         s.points.push_back({v->basePoint.x, v->basePoint.y});
         s.bulges.push_back(v->bulge);
+        double sw, ew;
+        resolveVertexWidth(v->stawidth, v->endwidth, data.defstawidth, data.defendwidth, sw, ew);
+        s.startWidths.push_back(sw);
+        s.endWidths.push_back(ew);
     }
     if (!hasAnyBulge(s.bulges)) s.bulges.clear();
+    if (!hasAnyWidth(s.startWidths, s.endWidths)) { s.startWidths.clear(); s.endWidths.clear(); }
     s.color = resolveEntityColor(data);
     s.dashPattern = resolveEntityLineType(data);
     if (!s.points.empty()) addShape(std::move(s));

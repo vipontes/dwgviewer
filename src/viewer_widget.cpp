@@ -83,6 +83,32 @@ void sampleSegmentPoints(std::vector<QPointF> &pts, QPointF p1, QPointF p2, doub
     }
 }
 
+// Appends a filled straight trapezoid from p1 to p2 -- half-width w1/2 at
+// p1, w2/2 at p2 (w1==0 or w2==0 collapses that end to a point, the standard
+// "wide polyline as arrowhead" technique, e.g. this project's own
+// polyline_with_width_test.dwg) -- as its own closed subpath of `path`.
+// Callers that need a curved (bulged) band pre-sample it into straight
+// sub-chords first (see drawWidthAwarePolyline) rather than this function
+// special-casing arcs itself, the same "sample to straight sub-chords"
+// approach the rest of this file already uses for dashing an Arc/bulged
+// Polyline (see the class comment on drawStroke).
+void appendStraightBand(QPainterPath &path, QPointF p1, QPointF p2, double w1, double w2) {
+    const double dx = p2.x() - p1.x();
+    const double dy = p2.y() - p1.y();
+    const double len = std::hypot(dx, dy);
+    if (len < 1e-9) return;
+    const QPointF perp(-dy / len, dx / len);
+    const QPointF left1 = p1 + perp * (w1 / 2.0);
+    const QPointF left2 = p2 + perp * (w2 / 2.0);
+    const QPointF right2 = p2 - perp * (w2 / 2.0);
+    const QPointF right1 = p1 - perp * (w1 / 2.0);
+    path.moveTo(left1);
+    path.lineTo(left2);
+    path.lineTo(right2);
+    path.lineTo(right1);
+    path.closeSubpath();
+}
+
 // Strokes a polyline (pts.size() >= 2), optionally closed (an implicit last
 // segment from pts.back() back to pts.front()). A solid dashPattern is the
 // common case and stays a single QPainterPath / drawPath call; a dashed one
@@ -137,6 +163,92 @@ void drawStroke(QPainter &painter, const std::vector<QPointF> &pts, bool closed,
         }
     }
     painter.drawPath(path);
+}
+
+// Draws a Polyline Shape that carries per-segment width data
+// (Shape::startWidths/endWidths), combining width tapering with the dash
+// pattern in a single pass so a dashed *and* widthed polyline (a real
+// combination -- see this project's own teste.dxf, which has LWPOLYLINEs on
+// a "Tracejada" (dashed) layer that also carry a nonzero constant width)
+// renders dashed filled bands, rather than either a solid bar (width
+// honored, dash ignored) or a thin dashed line (dash honored, width
+// ignored). Both the dash phase and the width taper are carried as one
+// continuous distance parameter across the whole polyline -- same reasoning
+// as drawStroke()'s dash phase staying continuous across vertices, extended
+// here to also keep the width taper continuous across a dash on/off
+// boundary. A zero-width dash "on" interval still draws as a plain cosmetic
+// line (not a degenerate zero-area fill), so a polyline mixing thin and
+// wide segments (e.g. a thin shaft with one wide tapered arrowhead segment)
+// keeps its thin segments crisp.
+void drawWidthAwarePolyline(QPainter &painter, const Shape &s) {
+    const size_t n = s.points.size();
+    const bool hasBulges = s.bulges.size() == n;
+    const size_t segCount = s.closed ? n : n - 1;
+    const std::vector<double> &dash = s.dashPattern;
+
+    QPainterPath strokePath; // zero-width dash "on" intervals
+    QPainterPath fillPath;   // nonzero-width dash "on" intervals
+    fillPath.setFillRule(Qt::WindingFill);
+
+    size_t patternIdx = 0;
+    double remaining = dash.empty() ? 0.0 : dash[0];
+    bool on = true; // dash[0] is always a dash, see resolveEntityLineType
+
+    for (size_t i = 0; i < segCount; ++i) {
+        const QPointF p1(s.points[i].x, s.points[i].y);
+        const QPointF p2(s.points[(i + 1) % n].x, s.points[(i + 1) % n].y);
+        const double bulge = hasBulges ? s.bulges[i] : 0.0;
+        const double w1 = s.startWidths[i];
+        const double w2 = s.endWidths[i];
+
+        std::vector<QPointF> pts{p1};
+        sampleSegmentPoints(pts, p1, p2, bulge);
+        const int subCount = static_cast<int>(pts.size()) - 1;
+
+        for (int k = 0; k < subCount; ++k) {
+            const QPointF a = pts[k];
+            const QPointF b = pts[k + 1];
+            const double segLen = QLineF(a, b).length();
+            if (segLen < 1e-12) continue;
+            // Width at the endpoints of this straight sub-chord, lerped
+            // from the segment's own w1/w2 by the sub-chord's position
+            // within the (possibly arc-sampled) segment.
+            const double ta = static_cast<double>(k) / subCount;
+            const double tb = static_cast<double>(k + 1) / subCount;
+            const double wa = w1 + (w2 - w1) * ta;
+            const double wb = w1 + (w2 - w1) * tb;
+
+            double segPos = 0.0;
+            while (segPos < segLen) {
+                const double step = dash.empty() ? segLen : std::min(remaining, segLen - segPos);
+                const double u0 = segPos / segLen;
+                const double u1 = (segPos + step) / segLen;
+                if (on) {
+                    const QPointF sa = a + (b - a) * u0;
+                    const QPointF sb = a + (b - a) * u1;
+                    const double swid = wa + (wb - wa) * u0;
+                    const double ewid = wa + (wb - wa) * u1;
+                    if (swid == 0.0 && ewid == 0.0) {
+                        strokePath.moveTo(sa);
+                        strokePath.lineTo(sb);
+                    } else {
+                        appendStraightBand(fillPath, sa, sb, swid, ewid);
+                    }
+                }
+                segPos += step;
+                if (dash.empty()) break;
+                remaining -= step;
+                if (remaining <= 1e-9) {
+                    patternIdx = (patternIdx + 1) % dash.size();
+                    remaining = dash[patternIdx];
+                    on = !on;
+                }
+            }
+        }
+    }
+
+    if (!strokePath.isEmpty()) painter.drawPath(strokePath);
+    if (!fillPath.isEmpty()) painter.fillPath(fillPath, QBrush(QColor(s.color.r, s.color.g, s.color.b)));
 }
 
 // Samples one HatchLoop into a closed point ring, reusing the same
@@ -394,24 +506,31 @@ void ViewerWidget::paintEvent(QPaintEvent *) {
                 if (s.points.size() < 2) break;
                 const size_t n = s.points.size();
                 const bool hasBulges = s.bulges.size() == n;
-                std::vector<QPointF> pts;
-                pts.reserve(n);
-                pts.emplace_back(s.points[0].x, s.points[0].y);
-                for (size_t i = 1; i < n; ++i) {
-                    sampleSegmentPoints(pts, QPointF(s.points[i - 1].x, s.points[i - 1].y),
-                                        QPointF(s.points[i].x, s.points[i].y),
-                                        hasBulges ? s.bulges[i - 1] : 0.0);
+                const bool hasWidths = s.startWidths.size() == n && s.endWidths.size() == n;
+
+                if (!hasWidths) {
+                    std::vector<QPointF> pts;
+                    pts.reserve(n);
+                    pts.emplace_back(s.points[0].x, s.points[0].y);
+                    for (size_t i = 1; i < n; ++i) {
+                        sampleSegmentPoints(pts, QPointF(s.points[i - 1].x, s.points[i - 1].y),
+                                            QPointF(s.points[i].x, s.points[i].y),
+                                            hasBulges ? s.bulges[i - 1] : 0.0);
+                    }
+                    if (s.closed) {
+                        sampleSegmentPoints(pts, QPointF(s.points[n - 1].x, s.points[n - 1].y),
+                                            QPointF(s.points[0].x, s.points[0].y),
+                                            hasBulges ? s.bulges[n - 1] : 0.0);
+                    }
+                    // The closing edge, if any, is already sampled into pts
+                    // above (correctly, as an arc when it has a bulge) --
+                    // pass closed=false so drawStroke doesn't also add its
+                    // own implicit (always-straight) closing segment on top.
+                    drawStroke(painter, pts, /*closed=*/false, s.dashPattern);
+                    break;
                 }
-                if (s.closed) {
-                    sampleSegmentPoints(pts, QPointF(s.points[n - 1].x, s.points[n - 1].y),
-                                        QPointF(s.points[0].x, s.points[0].y),
-                                        hasBulges ? s.bulges[n - 1] : 0.0);
-                }
-                // The closing edge, if any, is already sampled into pts
-                // above (correctly, as an arc when it has a bulge) -- pass
-                // closed=false so drawStroke doesn't also add its own
-                // implicit (always-straight) closing segment on top of it.
-                drawStroke(painter, pts, /*closed=*/false, s.dashPattern);
+
+                drawWidthAwarePolyline(painter, s);
                 break;
             }
             case ShapeKind::Text: {

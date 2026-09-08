@@ -96,6 +96,23 @@ struct Shape {
     // conversion to a drawable arc.
     std::vector<double> bulges;
 
+    // Polyline only. Empty means every segment is the viewer's default
+    // cosmetic (always-0-width) stroke, same as a Shape with no width data
+    // at all -- this is the overwhelming majority of polylines, so an empty
+    // vector is the fast/common path, not a special case. When non-empty,
+    // sized 1-per-point exactly like bulges: startWidths[i]/endWidths[i] is
+    // the width (DXF codes 40/41, already resolved against the entity's
+    // constant-width/default-width fallback -- see DwgDocument::addLWPolyline
+    // /addPolyline) at the start/end of the segment points[i] -> points[i+1]
+    // (or points[N-1] -> points[0] when `closed`). A segment whose own
+    // startWidths[i]/endWidths[i] are both 0 still draws as a plain cosmetic
+    // stroke -- only segments with nonzero width draw as a filled band -- so
+    // a polyline can mix thin and wide segments (e.g. a thin shaft with one
+    // wide tapered arrowhead segment), matching how AutoCAD treats width
+    // per-segment rather than per-entity.
+    std::vector<double> startWidths;
+    std::vector<double> endWidths;
+
     // Line/Circle/Arc/Polyline only (never set for Text -- DXF/AutoCAD
     // always render text glyphs solid regardless of the entity's nominal
     // linetype). Empty means solid. Otherwise, alternating dash-length,
