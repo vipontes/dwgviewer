@@ -906,8 +906,10 @@ DwgDocument::DimStyleDefaults DwgDocument::uniformFallbackDimStyle(double refere
     return {arrow, arrow * 0.25, arrow * 0.7, arrow * 1.1};
 }
 
-DwgDocument::DimStyleDefaults DwgDocument::resolveDimStyle(const DRW_Dimension &dim, double referenceLength) {
-    auto it = dimStyles_.find(dim.getStyle());
+DwgDocument::DimStyleDefaults DwgDocument::resolveDimStyle(const std::string &styleName,
+                                                             const std::vector<std::shared_ptr<DRW_Variant>> &extData,
+                                                             double referenceLength) {
+    auto it = dimStyles_.find(styleName);
     if (it == dimStyles_.end()) it = dimStyles_.find("Standard");
 
     DimStyleDefaults style;
@@ -947,11 +949,11 @@ DwgDocument::DimStyleDefaults DwgDocument::resolveDimStyle(const DRW_Dimension &
     // the corresponding raw component before $DIMSCALE is applied --
     // AutoCAD's own precedence (most specific to this one dimension wins).
     double effectiveScale = dimScale_;
-    findDstyleXdataOverride(dim.extData, 40, effectiveScale);
-    findDstyleXdataOverride(dim.extData, 41, style.arrowSize);
-    findDstyleXdataOverride(dim.extData, 42, style.extOffset);
-    findDstyleXdataOverride(dim.extData, 44, style.extExtend);
-    findDstyleXdataOverride(dim.extData, 140, style.textHeight);
+    findDstyleXdataOverride(extData, 40, effectiveScale);
+    findDstyleXdataOverride(extData, 41, style.arrowSize);
+    findDstyleXdataOverride(extData, 42, style.extOffset);
+    findDstyleXdataOverride(extData, 44, style.extExtend);
+    findDstyleXdataOverride(extData, 140, style.textHeight);
 
     // $DIMSCALE (or this entity's own XDATA override of it) applies on top
     // of whichever style is in effect -- see the declaration comment for
@@ -1051,7 +1053,7 @@ void DwgDocument::addLinearStyleDimension(const DRW_Dimension &dim, Point2D p1, 
     const Point2D foot1{dimLinePt.x + s1 * dirX, dimLinePt.y + s1 * dirY};
     const Point2D foot2{dimLinePt.x + s2 * dirX, dimLinePt.y + s2 * dirY};
     const double measure = std::abs(s2 - s1);
-    const DimStyleDefaults style = resolveDimStyle(dim, measure);
+    const DimStyleDefaults style = resolveDimStyle(dim.getStyle(), dim.extData, measure);
     const RgbColor color = resolveEntityColor(dim);
 
     // Each extension line's own perpendicular offset from the dimension
@@ -1104,7 +1106,7 @@ void DwgDocument::addAngularStyleDimension(const DRW_Dimension &dim, Point2D ver
     const double radius = std::hypot(radiusThroughPoint.x - vertex.x, radiusThroughPoint.y - vertex.y);
     if (radius < 1e-9) return; // degenerate -- arc-location point sits on the vertex itself
 
-    const DimStyleDefaults style = resolveDimStyle(dim, radius);
+    const DimStyleDefaults style = resolveDimStyle(dim.getStyle(), dim.extData, radius);
     const double dir1 = std::atan2(edgePoint1.y - vertex.y, edgePoint1.x - vertex.x);
     const double dir2 = std::atan2(edgePoint2.y - vertex.y, edgePoint2.x - vertex.x);
     const double throughAngle = std::atan2(radiusThroughPoint.y - vertex.y, radiusThroughPoint.x - vertex.x);
@@ -1170,7 +1172,7 @@ void DwgDocument::addDimRadial(const DRW_DimRadial *data) {
     const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
     const double measure = std::hypot(onCircle.x - center.x, onCircle.y - center.y);
     const RgbColor color = resolveEntityColor(*data);
-    const DimStyleDefaults style = resolveDimStyle(*data, measure);
+    const DimStyleDefaults style = resolveDimStyle(data->getStyle(), data->extData, measure);
 
     addDimensionLine(onCircle, textAnchor, color);
     double dirAngle = std::atan2(textAnchor.y - onCircle.y, textAnchor.x - onCircle.x);
@@ -1186,7 +1188,7 @@ void DwgDocument::addDimDiametric(const DRW_DimDiametric *data) {
     const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
     const double measure = std::hypot(p2.x - p1.x, p2.y - p1.y);
     const RgbColor color = resolveEntityColor(*data);
-    const DimStyleDefaults style = resolveDimStyle(*data, measure);
+    const DimStyleDefaults style = resolveDimStyle(data->getStyle(), data->extData, measure);
 
     addDimensionLine(p1, textAnchor, color);
     double dirAngle = std::atan2(textAnchor.y - p1.y, textAnchor.x - p1.x);
@@ -1218,6 +1220,48 @@ void DwgDocument::addDimAngular3P(const DRW_DimAngular3p *data) {
     const Point2D p2{data->getSecondLine().x, data->getSecondLine().y};
     const Point2D throughPt{data->getDimPoint().x, data->getDimPoint().y};
     addAngularStyleDimension(*data, vertex, p1, p2, throughPt);
+}
+
+// A LEADER's annotation (the MTEXT/TEXT/TOLERANCE/INSERT block it points
+// at) is a separate entity in the file, only soft-linked via `annotHandle`
+// -- this viewer doesn't resolve that handle, but doesn't need to: that
+// annotation entity gets its own addMText/addText/etc callback independently
+// and renders wherever it's positioned, same as if it had no leader at all.
+// So this only needs the leader's own geometry: the line/spline-approximated
+// polyline through its vertices, plus an arrowhead at the first vertex
+// (nearest the annotated feature) when enabled.
+void DwgDocument::addLeader(const DRW_Leader *data) {
+    if (!data || data->vertexlist.size() < 2) return;
+
+    Shape s;
+    s.kind = ShapeKind::Polyline;
+    s.points.reserve(data->vertexlist.size());
+    double totalLength = 0.0;
+    for (size_t i = 0; i < data->vertexlist.size(); ++i) {
+        const auto &v = data->vertexlist[i];
+        s.points.push_back({v->x, v->y});
+        if (i > 0) {
+            const auto &prev = data->vertexlist[i - 1];
+            totalLength += std::hypot(v->x - prev->x, v->y - prev->y);
+        }
+    }
+    // leadertype==1 (spline) has no curve-fit data in DRW_Leader beyond
+    // these same vertices (no knots/weights) -- rendered as straight
+    // segments through them, the same "no curve data available" gap noted
+    // for SPLINE elsewhere in this project (see CLAUDE.md).
+    const RgbColor color = resolveEntityColor(*data);
+    s.color = color;
+    s.dashPattern = resolveEntityLineType(*data);
+    addShape(std::move(s));
+
+    if (data->arrow == 0) return; // arrowhead disabled, code 71
+
+    const Point2D tip{data->vertexlist.front()->x, data->vertexlist.front()->y};
+    const Point2D next{data->vertexlist[1]->x, data->vertexlist[1]->y};
+    if (std::hypot(next.x - tip.x, next.y - tip.y) < 1e-9) return; // degenerate first segment
+    const double dirAngle = std::atan2(next.y - tip.y, next.x - tip.x);
+    const DimStyleDefaults style = resolveDimStyle(data->style, data->extData, totalLength);
+    addDimensionArrow(tip, dirAngle, style.arrowSize, color);
 }
 
 void DwgDocument::addLWPolyline(const DRW_LWPolyline &data) {

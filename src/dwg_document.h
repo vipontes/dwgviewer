@@ -13,6 +13,7 @@
 // callbacks that carry geometry, and we can drop the entities straight
 // into simple structs ready for QPainter.
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -244,6 +245,7 @@ public:
     void addDimAngular(const DRW_DimAngular *data) override;
     void addDimAngular3P(const DRW_DimAngular3p *data) override;
     void addDimStyle(const DRW_Dimstyle &data) override;
+    void addLeader(const DRW_Leader *data) override;
 
     // --- Everything else in DRW_Interface is a no-op for a pure viewer.
     // Header/table/style callbacks are read but not used; the write*()
@@ -269,7 +271,6 @@ public:
     // rather than approximated with the wrong shape.
     void addDimOrdinate(const DRW_DimOrdinate *) override {}
     void addDimArc(const DRW_DimArc *) override {}
-    void addLeader(const DRW_Leader *) override {}
     void addViewport(const DRW_Viewport &) override {}
     void addImage(const DRW_Image *) override {}
     void linkImage(const DRW_ImageDef *) override {}
@@ -354,6 +355,13 @@ private:
         double textHeight;
     };
 
+    // Takes the style name and XDATA directly (rather than a `const
+    // DRW_Dimension &`) so LEADER entities -- which resolve their arrowhead
+    // through the exact same DIMSTYLE machinery as a DIMENSION's arrows, but
+    // aren't a DRW_Dimension subclass -- can share this same resolution
+    // instead of duplicating it. Callers pass dim.getStyle()/dim.extData or
+    // leader->style/leader->extData.
+    //
     // Looks up `styleName` (a dimension entity's own getStyle()) in
     // dimStyles_ (populated by addDimStyle from the file's DIMSTYLE table)
     // or falls back to dimStyles_["Standard"], then to the header-derived
@@ -404,7 +412,9 @@ private:
     // the initial bug report called out by value (500, 150, 930, 1015),
     // each overriding DIMSCALE to 100 (not the header's 12) and DIMTXT to
     // 2.6.
-    DimStyleDefaults resolveDimStyle(const DRW_Dimension &dim, double referenceLength);
+    DimStyleDefaults resolveDimStyle(const std::string &styleName,
+                                      const std::vector<std::shared_ptr<DRW_Variant>> &extData,
+                                      double referenceLength);
 
     // One arrow size shared by every dimension in a file with no
     // trustworthy size data anywhere (see resolveDimStyle) -- cached on
