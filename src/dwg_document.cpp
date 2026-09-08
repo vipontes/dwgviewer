@@ -63,6 +63,35 @@ bool bulgeArcExtent(const Point2D &p1, const Point2D &p2, double bulge,
     center = {midx + perpx * distToCenter, midy + perpy * distToCenter};
     return true;
 }
+
+// Shared by addSolid/addTrace: both are a filled quadrilateral (or triangle,
+// when the file sets the third and fourth corners equal) defined by the
+// same four DRW_Trace corners -- DRW_Solid adds nothing over DRW_Trace but
+// a different eType, and TRACE (its predecessor, still occasionally
+// written) is otherwise identical. Rendered as a solid-fill Hatch shape
+// (single loop, no bulges) rather than a new ShapeKind, since that's
+// already exactly what a flat-filled polygon is.
+//
+// DXF's documented vertex order for SOLID/TRACE is 1,2,3,4, but connecting
+// corners in that literal order self-intersects into a bowtie -- the
+// correct fill order swaps the last two, 1,2,4,3 (see the SOLID entity's
+// own group-code reference; this is a long-standing, deliberate DXF quirk,
+// not a libdxfrw gap).
+Shape buildFilledQuadShape(const DRW_Trace &data, const RgbColor &color) {
+    Shape s;
+    s.kind = ShapeKind::Hatch;
+    s.hatchFillKind = Shape::HatchFillKind::Solid;
+    s.color = color;
+    HatchLoop loop;
+    loop.points = {
+        {data.basePoint.x, data.basePoint.y},
+        {data.secPoint.x, data.secPoint.y},
+        {data.fourPoint.x, data.fourPoint.y},
+        {data.thirdPoint.x, data.thirdPoint.y},
+    };
+    s.hatchLoops.push_back(std::move(loop));
+    return s;
+}
 } // namespace
 
 RgbColor DwgDocument::resolveEntityColor(const DRW_Entity &data) const {
@@ -747,6 +776,14 @@ void DwgDocument::addArc(const DRW_Arc &data) {
     s.color = resolveEntityColor(data);
     s.dashPattern = resolveEntityLineType(data);
     addShape(std::move(s));
+}
+
+void DwgDocument::addSolid(const DRW_Solid &data) {
+    addShape(buildFilledQuadShape(data, resolveEntityColor(data)));
+}
+
+void DwgDocument::addTrace(const DRW_Trace &data) {
+    addShape(buildFilledQuadShape(data, resolveEntityColor(data)));
 }
 
 void DwgDocument::addHatch(const DRW_Hatch *data) {

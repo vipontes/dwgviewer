@@ -228,6 +228,8 @@ public:
     void addArc(const DRW_Arc &data) override;
     void addLWPolyline(const DRW_LWPolyline &data) override;
     void addPolyline(const DRW_Polyline &data) override;
+    void addSolid(const DRW_Solid &data) override;
+    void addTrace(const DRW_Trace &data) override;
     void addLayer(const DRW_Layer &data) override;
     void addText(const DRW_Text &data) override;
     void addMText(const DRW_MText &data) override;
@@ -262,9 +264,7 @@ public:
     void addEllipse(const DRW_Ellipse &) override {}
     void addSpline(const DRW_Spline *) override {}
     void addKnot(const DRW_Entity &) override {}
-    void addTrace(const DRW_Trace &) override {}
     void add3dFace(const DRW_3Dface &) override {}
-    void addSolid(const DRW_Solid &) override {}
     // DIMORDINATE and arc-length (DIMARC) dimensions aren't implemented --
     // their leader/jog geometry rules are distinct enough from the other
     // six types (see CLAUDE.md) that they're left as a documented gap
