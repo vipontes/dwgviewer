@@ -257,7 +257,13 @@ std::string sanitizeMTextContent(const std::string &raw) {
         char c = raw[i];
         if (c == '\\' && i + 1 < raw.size()) {
             char next = raw[i + 1];
-            if (next == 'P' || next == 'p') {
+            // \P (capital) is a hard paragraph break. \p (lowercase) is a
+            // different code -- paragraph properties (indent/justification,
+            // e.g. "\pxqc;" for centered) -- and must fall through to the
+            // generic ';'-terminated skip below instead of being treated as
+            // a break; conflating the two left the property argument
+            // ("xqc;...") in the visible text.
+            if (next == 'P') {
                 out += '\n';
                 ++i;
                 continue;
