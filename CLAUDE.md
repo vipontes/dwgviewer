@@ -121,12 +121,44 @@ make -j$(nproc)
   `MTEXT`/`INSERT`/`HATCH`/`DIMENSION` — notably `SPLINE`.
 - `HATCH`/`MPOLYGON` (`DwgDocument::addHatch` in `dwg_document.cpp`) render
   solid, gradient (2-stop, AutoCAD's "centered" shift ignored) and pattern
-  (real dashed/solid parallel lines from the file's own baked-in pattern
-  definition, not a `.pat` library lookup) fills, and boundary loops given
+  (see below) fills, and boundary loops given
   either as a polyline (bulge) list or as LINE/ARC edges. A boundary loop
   built from ELLIPSE or SPLINE edges isn't supported -- the whole hatch is
   silently dropped rather than drawn with a gap where that edge should be
   (see `buildHatchLoop` in `dwg_document.cpp`).
+  - Pattern fills have two sources, in this order: (1) the file's own baked
+    pattern definition lines (`Shape::hatchPatternLines`, real dashed/solid
+    parallel lines, already at final scale/angle -- DXF only); (2) when
+    there are none, the hatch's *name* (`Shape::hatchPatternName`, plus its
+    own scale/angle/origin) looked up in `resources/patterns/<name>.dxf`.
+    (2) is the only source for a DWG: **vendored reader gap** (not patched,
+    flagging per the policy above) -- `DRW_Hatch::parseDwg`
+    (`drw_entities.cpp`) reads each pattern definition line's fields into
+    locals used only for debug output and never fills `patternLines`. It
+    does store `name`/`scale`/`angle`, so the library path has what it needs;
+    note `angle` is raw DWG radians there but raw DXF *degrees* for a DXF
+    (`DwgDocument::readingDwg_` picks the unit in `addHatch`).
+  - The library files are LibreCAD's pattern format: an ordinary DXF whose
+    LINE/ARC/CIRCLE/LWPOLYLINE (and, in `gost_*.dxf`, solid HATCH dot)
+    geometry *is* one tile, repeated in both axes. The tile pitch is the
+    geometry's own bounding box, not `$EXTMIN`/`$EXTMAX` (the `gost_*` files
+    carry a +/-1e20 "unset" sentinel there). `loadHatchTile`/`hatchTileFor`/
+    `drawLibraryHatchPattern` in `viewer_widget.cpp` load a file through a
+    throwaway `DwgDocument`, flatten it to two `QPainterPath`s (strokes,
+    fills), and stamp it across the visible part of the boundary under
+    scale -> rotate -> translate, clipped to the boundary. Lookup is by
+    lowercased stem, same as fonts (`indexDirByStem`), from
+    `<exe_dir>/resources/patterns/`. Each entity's own color/linetype in the
+    pattern file is ignored -- the tile takes the hatch's color, drawn solid.
+  - A name with no file (`_USER`, or AutoCAD-only names such as `NET`/
+    `CONCRE`) draws nothing, as hatches with no definition lines did before.
+    A pattern too fine to resolve (tile pitch under ~3 px, or too many
+    strokes) is drawn as a solid fill instead, as AutoCAD does.
+    A hatch's `scale` is applied to the library tile unchanged, exactly as
+    LibreCAD does (tiles are ~100 units across). That is not AutoCAD's own
+    `.pat` scale: e.g. library `ANSI31` lines are 1.414 units apart at scale 1
+    vs. AutoCAD's 3.175, so a DWG's hatch density can differ from AutoCAD's.
+    A mirrored INSERT (negative scale) doesn't mirror a library pattern.
 - `DIMENSION` (`DwgDocument::addDim*` in `dwg_document.cpp`) is handled for
   `DIMLINEAR`/`DIMALIGNED`/`DIMRADIAL`/`DIMDIAMETRIC`/`DIMANGULAR`/
   `DIMANGULAR3P` (the six common types). Geometry (extension lines,

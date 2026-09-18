@@ -179,6 +179,22 @@ struct Shape {
     // Hatch/Pattern only: the file's own pattern definition lines, already
     // in radians -- see HatchPatternLine.
     std::vector<HatchPatternLine> hatchPatternLines;
+
+    // Hatch/Pattern only, and only set when the file carried *no* pattern
+    // definition lines of its own (hatchPatternLines empty): the pattern's
+    // name (DXF/DWG code 2, verbatim -- e.g. "ANSI31") plus the hatch's own
+    // scale (code 41) and angle (code 52, already in radians) and the
+    // document-space point the pattern tiles from. ViewerWidget resolves the
+    // name against resources/patterns/<name>.dxf (see hatchTileFor) -- same
+    // "model carries the name, viewer finds the file" split as `fontFile`,
+    // keeping this header Qt/filesystem-free. This is the only source for a
+    // DWG hatch (libdxfrw's DRW_Hatch::parseDwg skips over the definition
+    // lines instead of storing them) and for a DXF written by a tool that
+    // only records the name (e.g. LibreCAD).
+    std::string hatchPatternName;
+    double hatchPatternScale = 1.0;
+    double hatchPatternAngleRad = 0.0;
+    Point2D hatchPatternOrigin;
 };
 
 // 2D affine transform (x' = a*x + c*y + e; y' = b*x + d*y + f), used only to
@@ -524,4 +540,9 @@ private:
     // and DWG -- only genuinely reusable named blocks get captured here.
     bool insideBlock_ = false;
     std::string currentBlockName_;
+
+    // True while loadFile() is reading a .dwg. libdxfrw stores some angles
+    // raw in each format's own unit (DXF degrees, DWG radians) -- see
+    // addHatch's use of DRW_Hatch::angle.
+    bool readingDwg_ = false;
 };

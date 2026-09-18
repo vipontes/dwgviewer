@@ -550,6 +550,11 @@ Shape transformShape(const Shape &s, const Transform2D &t) {
         line.angleRad = line.angleRad + rotation;
         for (double &d : line.dashPattern) d *= scale; // scale is never negative -- sign (dash/gap) is preserved
     }
+    if (!s.hatchPatternName.empty()) {
+        out.hatchPatternOrigin = applyTransform(t, s.hatchPatternOrigin);
+        out.hatchPatternScale = s.hatchPatternScale * scale;
+        out.hatchPatternAngleRad = s.hatchPatternAngleRad + rotation;
+    }
     return out;
 }
 } // namespace
@@ -843,6 +848,15 @@ void DwgDocument::addHatch(const DRW_Hatch *data) {
             line.offset = {pl.offsetX, pl.offsetY};
             line.dashPattern = pl.dashList;
             s.hatchPatternLines.push_back(std::move(line));
+        }
+        // No definition lines in the file (always the case for a DWG, see
+        // Shape::hatchPatternName) -- fall back to the named pattern library.
+        // "_USER" (a user-defined pattern) and "SOLID" have no library file,
+        // so ViewerWidget's lookup simply finds nothing for them.
+        if (s.hatchPatternLines.empty() && !data->name.empty()) {
+            s.hatchPatternName = data->name;
+            s.hatchPatternScale = data->scale > 0.0 ? data->scale : 1.0;
+            s.hatchPatternAngleRad = readingDwg_ ? data->angle : data->angle * M_PI / 180.0;
         }
     }
 
@@ -1399,6 +1413,7 @@ bool DwgDocument::loadFile(const std::string &path) {
     currentBlockName_.clear();
 
     const std::string ext = lowerExt(path);
+    readingDwg_ = ext == "dwg";
     bool ok = false;
 
     if (ext == "dxf") {

@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 
 namespace {
@@ -391,6 +392,196 @@ void drawHatchPatternLine(QPainter &painter, const HatchPatternLine &pl, const Q
     painter.drawPath(path);
 }
 
+// --- Resource directories ---------------------------------------------------
+// Both resources/fonts (.lff) and resources/patterns (.dxf) ship next to the
+// executable rather than as Qt resources (see CMakeLists.txt's post-build
+// copy), and are looked up by lowercased file stem.
+
+// Lowercased stem -> absolute path of every file in `dir` matching
+// `nameFilter`. Empty if `dir` doesn't exist.
+std::unordered_map<std::string, QString> indexDirByStem(const QString &dir, const QString &nameFilter) {
+    std::unordered_map<std::string, QString> m;
+    const QFileInfoList entries = QDir(dir).entryInfoList(QStringList{nameFilter}, QDir::Files);
+    for (const QFileInfo &fi : entries) {
+        m[fi.completeBaseName().toLower().toStdString()] = fi.absoluteFilePath();
+    }
+    return m;
+}
+
+// --- Hatch pattern library --------------------------------------------------
+// A HATCH that names a pattern but carries no definition lines of its own
+// (every DWG hatch, see Shape::hatchPatternName) is drawn from
+// resources/patterns/<name>.dxf. Each file is LibreCAD's pattern format: one
+// small drawing (LINE/ARC/CIRCLE/LWPOLYLINE, occasionally solid HATCH dots)
+// whose own bounding box is the tile that repeats in both directions -- the
+// files' $EXTMIN/$EXTMAX header values are unreliable (several carry a
+// +/-1e20 "unset" sentinel), so the pitch is measured from the geometry.
+
+// One pattern file, flattened to two paths in tile space (unscaled, unrotated,
+// tile origin wherever the file drew it). Per-entity colors/linetypes in the
+// pattern file are deliberately ignored: the whole tile takes the using
+// hatch's color and strokes solid.
+struct HatchTile {
+    QPainterPath strokes;
+    QPainterPath fills; // solid-filled regions (e.g. the dots in gost_*.dxf)
+    QRectF bounds;      // the repeat cell; width/height are the pitch
+    int elementCount = 0;
+};
+
+const QString &hatchPatternsDir() {
+    static const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/resources/patterns");
+    return dir;
+}
+
+std::shared_ptr<const HatchTile> loadHatchTile(const QString &path) {
+    DwgDocument doc;
+    if (!doc.loadFile(path.toStdString())) return nullptr;
+
+    auto tile = std::make_shared<HatchTile>();
+    for (const Shape &s : doc.shapes()) {
+        switch (s.kind) {
+            case ShapeKind::Line:
+                if (s.points.size() != 2) break;
+                tile->strokes.moveTo(s.points[0].x, s.points[0].y);
+                tile->strokes.lineTo(s.points[1].x, s.points[1].y);
+                break;
+            case ShapeKind::Circle:
+                tile->strokes.addEllipse(QPointF(s.center.x, s.center.y), s.radius, s.radius);
+                break;
+            case ShapeKind::Arc: {
+                // Same cos/sin sampling as paintEvent's Arc case (not
+                // QPainterPath::arcTo -- see CLAUDE.md on Qt's angle convention).
+                const double start = s.startAngleRad;
+                double end = s.endAngleRad;
+                if (end < start) end += 2 * M_PI;
+                constexpr int kSegments = 48;
+                for (int i = 0; i <= kSegments; ++i) {
+                    const double t = start + (end - start) * i / kSegments;
+                    const QPointF p(s.center.x + s.radius * std::cos(t), s.center.y + s.radius * std::sin(t));
+                    if (i == 0) tile->strokes.moveTo(p); else tile->strokes.lineTo(p);
+                }
+                break;
+            }
+            case ShapeKind::Polyline: {
+                const size_t n = s.points.size();
+                if (n < 2) break;
+                const bool hasBulges = s.bulges.size() == n;
+                std::vector<QPointF> pts;
+                pts.emplace_back(s.points[0].x, s.points[0].y);
+                for (size_t i = 1; i < n; ++i) {
+                    sampleSegmentPoints(pts, QPointF(s.points[i - 1].x, s.points[i - 1].y),
+                                        QPointF(s.points[i].x, s.points[i].y), hasBulges ? s.bulges[i - 1] : 0.0);
+                }
+                if (s.closed) {
+                    sampleSegmentPoints(pts, QPointF(s.points[n - 1].x, s.points[n - 1].y),
+                                        QPointF(s.points[0].x, s.points[0].y), hasBulges ? s.bulges[n - 1] : 0.0);
+                }
+                tile->strokes.moveTo(pts[0]);
+                for (size_t i = 1; i < pts.size(); ++i) tile->strokes.lineTo(pts[i]);
+                break;
+            }
+            case ShapeKind::Hatch:
+                if (s.hatchFillKind == Shape::HatchFillKind::Solid) tile->fills.addPath(buildHatchPath(s));
+                break;
+            case ShapeKind::Text:
+                break; // no pattern uses text
+        }
+    }
+
+    const bool hasStrokes = !tile->strokes.isEmpty(), hasFills = !tile->fills.isEmpty();
+    if (!hasStrokes && !hasFills) return nullptr;
+    tile->bounds = !hasFills ? tile->strokes.boundingRect()
+                 : !hasStrokes ? tile->fills.boundingRect()
+                               : tile->strokes.boundingRect().united(tile->fills.boundingRect());
+    if (tile->bounds.width() < 1e-9 || tile->bounds.height() < 1e-9) return nullptr; // no 2D repeat cell
+    tile->elementCount = tile->strokes.elementCount() + tile->fills.elementCount();
+    return tile;
+}
+
+// Resolves a HATCH pattern name (e.g. "ANSI31") to a loaded, cached tile --
+// nullptr for a name with no file in resources/patterns (a "_USER" pattern,
+// an AutoCAD-only name, ...), which the caller draws as nothing. The cache
+// stores nullptr results too, so an unknown name doesn't re-hit the disk on
+// every repaint.
+std::shared_ptr<const HatchTile> hatchTileFor(const std::string &patternName) {
+    static const std::unordered_map<std::string, QString> index =
+        indexDirByStem(hatchPatternsDir(), QStringLiteral("*.dxf"));
+    static std::unordered_map<std::string, std::shared_ptr<const HatchTile>> cache;
+
+    const std::string key = QString::fromStdString(patternName).trimmed().toLower().toStdString();
+    if (auto cached = cache.find(key); cached != cache.end()) return cached->second;
+
+    std::shared_ptr<const HatchTile> tile;
+    if (auto it = index.find(key); it != index.end()) tile = loadHatchTile(it->second);
+    cache[key] = tile;
+    return tile;
+}
+
+// Tiles `s`'s library pattern across `boundary` (already the hatch's
+// even-odd path, in document space). `painter` must currently carry
+// `documentToScreen`; it's restored on return.
+//
+// Tile (i, j) is the pattern file's own drawing shifted by (i*w, j*h), all
+// under scale (Shape::hatchPatternScale) -> rotate (hatchPatternAngleRad) ->
+// translate (hatchPatternOrigin) into document space. Only the tiles that
+// overlap the visible part of the boundary are drawn.
+void drawLibraryHatchPattern(QPainter &painter, const Shape &s, const QPainterPath &boundary,
+                             const QTransform &documentToScreen, const QRect &viewport) {
+    const std::shared_ptr<const HatchTile> tile = hatchTileFor(s.hatchPatternName);
+    if (!tile || !(s.hatchPatternScale > 0.0)) return;
+
+    bool invertible = false;
+    const QTransform screenToDocument = documentToScreen.inverted(&invertible);
+    if (!invertible) return;
+    const QRectF visible = boundary.boundingRect().intersected(screenToDocument.mapRect(QRectF(viewport)));
+    if (visible.isEmpty()) return;
+
+    QTransform tileToDocument;
+    tileToDocument.translate(s.hatchPatternOrigin.x, s.hatchPatternOrigin.y);
+    tileToDocument.rotateRadians(s.hatchPatternAngleRad);
+    tileToDocument.scale(s.hatchPatternScale, s.hatchPatternScale);
+    const QRectF needed = tileToDocument.inverted().mapRect(visible);
+
+    const double w = tile->bounds.width(), h = tile->bounds.height();
+
+    // A pattern too fine to resolve (tiles a couple of pixels wide, or so
+    // many strokes it would stall the repaint) reads as a solid fill anyway
+    // -- which is also what AutoCAD does when a hatch is too dense. The
+    // pitch check comes first: past it, the tile indices below span at most
+    // the viewport / kMinPitchPx, so they can't overflow an int (a hatch
+    // with a near-zero scale would otherwise ask for billions of tiles).
+    constexpr double kMinPitchPx = 3.0;
+    constexpr std::int64_t kMaxElements = 400000;
+    const double pixelsPerUnit = std::hypot(documentToScreen.m11(), documentToScreen.m12());
+    const double pitchPx = std::min(w, h) * s.hatchPatternScale * pixelsPerUnit;
+    const QColor color(s.color.r, s.color.g, s.color.b);
+    if (!(pitchPx >= kMinPitchPx)) { // also catches NaN
+        painter.fillPath(boundary, color);
+        return;
+    }
+
+    const int i0 = static_cast<int>(std::floor((needed.left() - tile->bounds.left()) / w));
+    const int i1 = static_cast<int>(std::floor((needed.right() - tile->bounds.left()) / w));
+    const int j0 = static_cast<int>(std::floor((needed.top() - tile->bounds.top()) / h));
+    const int j1 = static_cast<int>(std::floor((needed.bottom() - tile->bounds.top()) / h));
+    const std::int64_t tileCount = static_cast<std::int64_t>(i1 - i0 + 1) * (j1 - j0 + 1);
+    if (tileCount * tile->elementCount > kMaxElements) {
+        painter.fillPath(boundary, color);
+        return;
+    }
+
+    painter.save();
+    painter.setClipPath(boundary, Qt::IntersectClip);
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            painter.setTransform(QTransform::fromTranslate(i * w, j * h) * tileToDocument * documentToScreen);
+            painter.drawPath(tile->strokes);
+            if (!tile->fills.isEmpty()) painter.fillPath(tile->fills, color);
+        }
+    }
+    painter.restore();
+}
+
 // --- LFF stroke-font resolution -------------------------------------------
 // TEXT/MTEXT's actual font, per the file's own STYLE table (see
 // DwgDocument::addTextStyle / Shape::fontFile), is looked up here rather
@@ -411,15 +602,8 @@ const QString &lffFontsDir() {
 // regardless of the filesystem's own case sensitivity, and regardless of
 // which extension a STYLE table's font name carries.
 const std::unordered_map<std::string, QString> &lffFontIndex() {
-    static const std::unordered_map<std::string, QString> index = [] {
-        std::unordered_map<std::string, QString> m;
-        const QDir dir(lffFontsDir());
-        const QFileInfoList entries = dir.entryInfoList(QStringList{QStringLiteral("*.lff")}, QDir::Files);
-        for (const QFileInfo &fi : entries) {
-            m[fi.completeBaseName().toLower().toStdString()] = fi.absoluteFilePath();
-        }
-        return m;
-    }();
+    static const std::unordered_map<std::string, QString> index =
+        indexDirByStem(lffFontsDir(), QStringLiteral("*.lff"));
     return index;
 }
 
@@ -797,6 +981,14 @@ void ViewerWidget::paintEvent(QPaintEvent *) {
                         break;
                     }
                     case Shape::HatchFillKind::Pattern: {
+                        if (s.hatchPatternLines.empty()) {
+                            // No lines in the file itself -- use the named
+                            // pattern from resources/patterns, if any.
+                            if (!s.hatchPatternName.empty()) {
+                                drawLibraryHatchPattern(painter, s, path, documentToScreen_, rect());
+                            }
+                            break;
+                        }
                         painter.save();
                         painter.setClipPath(path, Qt::IntersectClip);
                         const QRectF bounds = path.boundingRect();
