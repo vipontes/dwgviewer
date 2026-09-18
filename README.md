@@ -96,7 +96,7 @@ the Qt path/version to match your install):
 
 ```powershell
 mkdir build
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="C:/Qt/6.11.2/msvc2022_64"
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="C:/Qt/6.10.3/msvc2022_64"
 cmake --build build --config Release
 ```
 
