@@ -107,6 +107,29 @@ void DRW_TextCodec::setCodePage(const std::string &c, bool dxfFormat){
         conv.reset( new DRW_ConvTable(DRW_Table1250, CPLENGTHCOMMON) );
     else if (cp == "ANSI_1251")
         conv.reset( new DRW_ConvTable(DRW_Table1251, CPLENGTHCOMMON) );
+    // ANSI_1252 (Western Europe/Latin -- covers Portuguese/Spanish/French/
+    // German accents) was the one single-byte codepage missing its own
+    // DRW_ConvTable branch here, unlike every sibling above/below it. For
+    // DWG (dxfFormat=false) that's silently masked by the catch-all `else`
+    // a few lines down, which already uses DRW_Table1252 -- but for DXF
+    // (dxfFormat=true) it fell through to the `else if (dxfFormat)` branch
+    // instead, a passthrough DRW_Converter that assumes its input is
+    // already UTF-8 and doesn't touch single high bytes at all. Any
+    // classic (pre-2007/ASCII, non-UTF-8) DXF written on a Western-
+    // European Windows locale -- i.e. containing raw CP1252 bytes for
+    // accented letters, the normal case for $DWGCODEPAGE=ANSI_1252 -- had
+    // those bytes pass through unconverted, so downstream UTF-8 decoding
+    // (see ViewerWidget's QString::fromUtf8 of Shape::text) mangled every
+    // accented character into a REPLACEMENT CHARACTER (confirmed against
+    // this project's own dwgviewer: Ç/Ú/Á/Ã all rendered as the stroke
+    // fonts' literal U+FFFD glyph, a small diamond -- not a font-rendering
+    // bug, this codec gap upstream of it). Flagged per this project's
+    // vendoring policy (CLAUDE.md) rather than patched silently, and
+    // ideally upstreamed to LibreCAD -- this one-line fix just restores
+    // the same DRW_ConvTable(DRW_Table1252, CPLENGTHCOMMON) treatment its
+    // 1250/1251/1253-1258 siblings already get.
+    else if (cp == "ANSI_1252")
+        conv.reset( new DRW_ConvTable(DRW_Table1252, CPLENGTHCOMMON) );
     else if (cp == "ANSI_1253")
         conv.reset( new DRW_ConvTable(DRW_Table1253, CPLENGTHCOMMON) );
     else if (cp == "ANSI_1254")

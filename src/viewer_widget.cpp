@@ -1,7 +1,12 @@
 #include "viewer_widget.h"
 
+#include "lff_font.h"
+
 #include <QBrush>
 #include <QColor>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QFont>
 #include <QFontMetricsF>
 #include <QLinearGradient>
@@ -13,9 +18,11 @@
 #include <QMouseEvent>
 #include <QResizeEvent>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <unordered_map>
 
 namespace {
 // Converts a DXF/DWG polyline vertex "bulge" (tan(includedAngle/4), signed:
@@ -383,6 +390,168 @@ void drawHatchPatternLine(QPainter &painter, const HatchPatternLine &pl, const Q
     }
     painter.drawPath(path);
 }
+
+// --- LFF stroke-font resolution -------------------------------------------
+// TEXT/MTEXT's actual font, per the file's own STYLE table (see
+// DwgDocument::addTextStyle / Shape::fontFile), is looked up here rather
+// than in DwgDocument since finding/parsing a font *file on disk* is a
+// rendering concern, not a document-model one -- dwg_document.h stays
+// Qt/filesystem-free (see Shape::fontFile's comment).
+
+// "<exe_dir>/resources/fonts" -- fonts ship next to the executable, not
+// bundled as Qt resources, so they can be added/replaced without rebuilding.
+const QString &lffFontsDir() {
+    static const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/resources/fonts");
+    return dir;
+}
+
+// Lowercased font stem (no directory, no extension) -> absolute .lff path,
+// built once from whatever's actually in resources/fonts/. Matching by
+// stem alone (rather than exact filename) means the lookup works
+// regardless of the filesystem's own case sensitivity, and regardless of
+// which extension a STYLE table's font name carries.
+const std::unordered_map<std::string, QString> &lffFontIndex() {
+    static const std::unordered_map<std::string, QString> index = [] {
+        std::unordered_map<std::string, QString> m;
+        const QDir dir(lffFontsDir());
+        const QFileInfoList entries = dir.entryInfoList(QStringList{QStringLiteral("*.lff")}, QDir::Files);
+        for (const QFileInfo &fi : entries) {
+            m[fi.completeBaseName().toLower().toStdString()] = fi.absoluteFilePath();
+        }
+        return m;
+    }();
+    return index;
+}
+
+// Strips any directory and extension from a STYLE table font name (e.g.
+// "romans.shx" -> "romans"), lowercased for lffFontIndex() lookup.
+std::string lffFontStem(const std::string &fontFile) {
+    const size_t slash = fontFile.find_last_of("/\\");
+    std::string base = slash == std::string::npos ? fontFile : fontFile.substr(slash + 1);
+    const size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    std::transform(base.begin(), base.end(), base.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return base;
+}
+
+// Resolves a Shape::fontFile to a loaded, cached LffFont -- nullptr if
+// `fontFile` is empty (no STYLE override known) or names a font this
+// project has no shipped .lff for (e.g. a TTF style name like "Arial", or
+// an SHX name with no bundled equivalent -- see CLAUDE.md). Callers treat
+// nullptr identically: fall back to Qt's system font, matching this
+// viewer's behavior before LFF support existed. The cache also stores
+// nullptr results so an unresolvable style doesn't re-scan the directory
+// index on every repaint.
+std::shared_ptr<const LffFont> lffFontFor(const std::string &fontFile) {
+    if (fontFile.empty()) return nullptr;
+    static std::unordered_map<std::string, std::shared_ptr<const LffFont>> cache;
+    const std::string stem = lffFontStem(fontFile);
+    if (auto cached = cache.find(stem); cached != cache.end()) return cached->second;
+
+    std::shared_ptr<const LffFont> font;
+    if (auto it = lffFontIndex().find(stem); it != lffFontIndex().end()) {
+        font = LffFont::loadFromFile(it->second.toStdString());
+    }
+    cache[stem] = font;
+    return font;
+}
+
+// LibreCAD ships "unicode.lff" as a broad-coverage fallback for glyphs a
+// narrower stroke font (most of resources/fonts/*.lff are Latin-only)
+// doesn't define -- used below whenever the entity's own resolved font is
+// missing a codepoint, before giving up and leaving a blank advance.
+const LffFont *lffFallbackFont() {
+    static const std::shared_ptr<const LffFont> fallback = lffFontFor("unicode.lff");
+    return fallback.get();
+}
+
+// Looks up `cp` in `font`, then `fallback`, writing this character's
+// advance (font design units, already includes `font`'s own LetterSpacing)
+// into `advance` regardless of whether a glyph was found -- an undefined
+// codepoint (most commonly a space, which no .lff glyph section defines)
+// still needs to move the pen, via `font`'s WordSpacing, so later
+// characters on the line don't overlap it.
+const LffGlyph *lffStepGlyph(const LffFont &font, const LffFont *fallback, char32_t cp, double &advance) {
+    const LffGlyph *glyph = font.findGlyph(cp);
+    if (!glyph && fallback) glyph = fallback->findGlyph(cp);
+    advance = (glyph ? glyph->advance : font.wordSpacing) + font.letterSpacing;
+    return glyph;
+}
+
+double lffLineWidth(const LffFont &font, const LffFont *fallback, const QString &line) {
+    double width = 0.0;
+    for (const uint cp : line.toUcs4()) {
+        double advance = 0.0;
+        lffStepGlyph(font, fallback, static_cast<char32_t>(cp), advance);
+        width += advance;
+    }
+    return width;
+}
+
+// AutoCAD/LibreCAD's MTEXT line-spacing-factor 1.0 corresponds to roughly
+// 5/3 of the text height between baselines ("exact" spacing) -- there's no
+// per-font metric for this in the .lff format itself (unlike LetterSpacing/
+// WordSpacing), so this is a fixed approximation shared by every LFF font,
+// same spirit as this project's other documented "reasonable
+// approximation" choices (see CLAUDE.md's HATCH gradient note).
+constexpr double kLffLineSpacingRatio = 5.0 / 3.0;
+
+// Draws `lines` (already split on '\n') using `font` (falling back to
+// `fallback` per-glyph, see lffStepGlyph) into the QPainter's *current*
+// local transform -- caller has already translated/rotated to the text
+// entity's anchor exactly like the QFont path below, so this only needs to
+// place glyphs relative to that origin. `capHeightPx` is the on-screen
+// pixel size of the font's 9-design-unit cap height (see LffGlyph's
+// comment), the LFF equivalent of the QFont path's pixelHeight.
+void drawLffTextLines(QPainter &painter, const QStringList &lines, const LffFont &font,
+                       const LffFont *fallback, double capHeightPx, TextHAlign hAlign, TextVAlign vAlign) {
+    const double scale = capHeightPx / 9.0;
+    const double linePitchPx = capHeightPx * font.lineSpacingFactor * kLffLineSpacingRatio;
+    const double blockHeight = linePitchPx * lines.size();
+
+    double firstBaselineY;
+    switch (vAlign) {
+        case TextVAlign::Top:      firstBaselineY = capHeightPx; break;
+        case TextVAlign::Middle:   firstBaselineY = capHeightPx - blockHeight / 2.0; break;
+        case TextVAlign::Bottom:   firstBaselineY = capHeightPx - blockHeight; break;
+        case TextVAlign::Baseline: default: firstBaselineY = 0.0;
+    }
+
+    double y = firstBaselineY;
+    for (const QString &line : lines) {
+        double startX = 0.0;
+        if (hAlign == TextHAlign::Center) startX = -lffLineWidth(font, fallback, line) * scale / 2.0;
+        else if (hAlign == TextHAlign::Right) startX = -lffLineWidth(font, fallback, line) * scale;
+
+        double penX = 0.0;
+        for (const uint rawCp : line.toUcs4()) {
+            const char32_t cp = static_cast<char32_t>(rawCp);
+            double advance = 0.0;
+            const LffGlyph *glyph = lffStepGlyph(font, fallback, cp, advance);
+            if (glyph) {
+                // Glyph coordinates are Y-up (baseline at y=0, caps extend
+                // to y=+9, see LffGlyph's comment) but this local transform
+                // still follows QPainter's own Y-down screen convention
+                // (only documentToScreen_ carries a flip, and Text
+                // deliberately never composes with it -- see CLAUDE.md
+                // point #6) -- so each point's Y must be negated here, the
+                // same "flip glyphs explicitly, don't inherit one" rule
+                // that convention already calls out.
+                for (const std::vector<Point2D> &stroke : glyph->strokes) {
+                    for (size_t i = 1; i < stroke.size(); ++i) {
+                        const Point2D &a = stroke[i - 1];
+                        const Point2D &b = stroke[i];
+                        painter.drawLine(QPointF(startX + (penX + a.x) * scale, y - a.y * scale),
+                                          QPointF(startX + (penX + b.x) * scale, y - b.y * scale));
+                    }
+                }
+            }
+            penX += advance;
+        }
+        y += linePitchPx;
+    }
+}
 } // namespace
 
 ViewerWidget::ViewerWidget(QWidget *parent) : QWidget(parent) {
@@ -553,41 +722,52 @@ void ViewerWidget::paintEvent(QPaintEvent *) {
                 // documentToScreen_.
                 const QPointF originScreen =
                     documentToScreen_.map(QPointF(s.center.x, s.center.y));
-                int pixelHeight = static_cast<int>(std::round(s.textHeightDoc * pixelsPerUnit));
-                if (pixelHeight < 1) pixelHeight = 1;
-
-                QFont font = painter.font();
-                font.setPixelSize(pixelHeight);
-                QFontMetricsF metrics(font);
+                double capHeightPx = s.textHeightDoc * pixelsPerUnit;
+                if (capHeightPx < 1.0) capHeightPx = 1.0;
 
                 const QStringList lines = QString::fromUtf8(s.text.c_str()).split(QLatin1Char('\n'));
-                const double linePitch = metrics.height();
-                const double blockHeight = linePitch * lines.size();
-
-                double firstBaselineY;
-                switch (s.textVAlign) {
-                    case TextVAlign::Top:      firstBaselineY = metrics.ascent(); break;
-                    case TextVAlign::Middle:   firstBaselineY = metrics.ascent() - blockHeight / 2.0; break;
-                    case TextVAlign::Bottom:   firstBaselineY = metrics.ascent() - blockHeight; break;
-                    case TextVAlign::Baseline: default: firstBaselineY = 0.0; break;
-                }
 
                 painter.save();
                 painter.resetTransform();
                 painter.translate(originScreen);
                 painter.rotate(-s.textAngleRad * 180.0 / M_PI);
-                painter.setFont(font);
 
-                double y = firstBaselineY;
-                for (const QString &line : lines) {
-                    double x = 0.0;
-                    if (s.textHAlign == TextHAlign::Center) {
-                        x = -metrics.horizontalAdvance(line) / 2.0;
-                    } else if (s.textHAlign == TextHAlign::Right) {
-                        x = -metrics.horizontalAdvance(line);
+                // Only entities whose STYLE table names a font this project
+                // actually ships a .lff for take this path (see
+                // lffFontFor) -- everything else (no STYLE override, or one
+                // naming e.g. a TTF font) falls through to the Qt path
+                // below exactly as before LFF support existed.
+                if (const std::shared_ptr<const LffFont> lffFont = lffFontFor(s.fontFile)) {
+                    drawLffTextLines(painter, lines, *lffFont, lffFallbackFont(), capHeightPx,
+                                      s.textHAlign, s.textVAlign);
+                } else {
+                    QFont font = painter.font();
+                    font.setPixelSize(static_cast<int>(std::round(capHeightPx)));
+                    QFontMetricsF metrics(font);
+
+                    const double linePitch = metrics.height();
+                    const double blockHeight = linePitch * lines.size();
+
+                    double firstBaselineY;
+                    switch (s.textVAlign) {
+                        case TextVAlign::Top:      firstBaselineY = metrics.ascent(); break;
+                        case TextVAlign::Middle:   firstBaselineY = metrics.ascent() - blockHeight / 2.0; break;
+                        case TextVAlign::Bottom:   firstBaselineY = metrics.ascent() - blockHeight; break;
+                        case TextVAlign::Baseline: default: firstBaselineY = 0.0; break;
                     }
-                    painter.drawText(QPointF(x, y), line);
-                    y += linePitch;
+
+                    painter.setFont(font);
+                    double y = firstBaselineY;
+                    for (const QString &line : lines) {
+                        double x = 0.0;
+                        if (s.textHAlign == TextHAlign::Center) {
+                            x = -metrics.horizontalAdvance(line) / 2.0;
+                        } else if (s.textHAlign == TextHAlign::Right) {
+                            x = -metrics.horizontalAdvance(line);
+                        }
+                        painter.drawText(QPointF(x, y), line);
+                        y += linePitch;
+                    }
                 }
                 painter.restore();
                 break;

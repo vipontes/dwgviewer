@@ -42,6 +42,8 @@ add_executable(dwgviewer
     src/main.cpp
     src/dwg_document.cpp
     src/dwg_document.h
+    src/lff_font.cpp
+    src/lff_font.h
     src/viewer_widget.cpp
     src/viewer_widget.h
 )
@@ -55,4 +57,19 @@ if(WIN32)
     # (cmd/PowerShell), so stderr diagnostics and --png output still show up
     # there.
     set_target_properties(dwgviewer PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+# ViewerWidget looks up TEXT/MTEXT stroke fonts (resources/fonts/*.lff) next
+# to the built executable at runtime (see lffFontsDir() in viewer_widget.cpp)
+# rather than bundling them as Qt resources, so they can be added/replaced
+# without a rebuild. Copy the whole resources/ tree alongside the exe on
+# every build so a fresh `cmake .. && make` (see README/CLAUDE.md's Build &
+# run section) has them without a manual copy step.
+if(EXISTS "${CMAKE_SOURCE_DIR}/resources")
+    add_custom_command(TARGET dwgviewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/resources"
+                "$<TARGET_FILE_DIR:dwgviewer>/resources"
+        COMMENT "Copying resources/ (fonts, hatch patterns) next to dwgviewer"
+    )
 endif()

@@ -85,6 +85,26 @@ straight from `third_party/libdxfrw/libdxfrw_sources.cmake` instead. Don't
 "fix" this by switching to `add_subdirectory(third_party/libdxfrw)` without
 checking that broken path first.
 
+One exception to the "read-only" rule so far, per the "flag explicitly and
+patch" policy above: `DRW_TextCodec::setCodePage`
+(`third_party/libdxfrw/src/intern/drw_textcodec.cpp`) was missing its
+`ANSI_1252` branch — every other single-byte codepage (1250/1251/1253-1258)
+gets its own `DRW_ConvTable(DRW_TableXXXX, CPLENGTHCOMMON)` conversion, but
+1252 (Western Europe/Latin -- Portuguese/Spanish/French/German accents) fell
+through to a plain passthrough converter for DXF reading (`dxfFormat=true`;
+DWG reading was unaffected, already covered by the function's catch-all
+`else`). Net effect: any classic (pre-2007, non-UTF-8) DXF with raw CP1252
+bytes for an accented letter -- the ordinary case for
+`$DWGCODEPAGE=ANSI_1252` -- had those bytes pass through unconverted, so
+they weren't valid UTF-8 by the time they reached `Shape::text`, and
+rendered as the stroke fonts' own `[FFFD]` "replacement character" glyph (a
+small diamond in both `romans.lff` and `unicode.lff`) instead of the actual
+letter. Fixed by adding the missing branch, mirroring its siblings exactly.
+Confirmed against this project's own dwgviewer: a DXF with `$ACADVER`
+pre-AC1021 and `$DWGCODEPAGE=ANSI_1252` containing raw CP1252 `Ç`/`Ú`/`Á`/`Ã`
+rendered as diamonds before the fix, correctly after. Should still be
+upstreamed to LibreCAD.
+
 ## Build & run
 
 ```bash
@@ -211,9 +231,38 @@ make -j$(nproc)
   Complex linetypes with embedded text/shapes (DXF code 74 flags) render as
   their plain dash/dot/gap skeleton (code 49 only) — the shape/text portion
   is silently dropped rather than approximated.
-- `TEXT`/`MTEXT` use the system default Qt font at the entity's DXF height,
-  not the file's actual `STYLE` table font/width-factor/oblique — style
-  lookup would need `addTextStyle` wired up the same way `addLayer` now is.
+- `TEXT`/`MTEXT` font resolution (`DwgDocument::addTextStyle`, keyed by the
+  entity's own style name same as `addLayer`) only covers the `STYLE`
+  table's font *file name* (code 3) → `resources/fonts/<stem>.lff`, an
+  exact case-insensitive stem match with no SHX/TTF alias table (e.g.
+  `"isocp.shx"` won't match `iso.lff`/`iso3098.lff` despite being the same
+  font family under AutoCAD's own naming — only a handful of this project's
+  shipped `.lff` stems happen to match real SHX names verbatim: `romans`,
+  `romanc`, `romand`, `simplex`, `standard`, `scripts`, `scriptc`,
+  `greekc`, `greekp`, `syastro`, `symap`, `symath`, `symeteo`, `symusic`).
+  A style naming anything else (a TTF font, an SHX with no shipped
+  equivalent, or no `STYLE` table entry at all) falls back to the system
+  Qt font at the entity's DXF height, exactly as before this was
+  implemented. Width-factor/oblique (`STYLE` codes 41/50, `DRW_Text`'s own
+  `widthscale`/`oblique`) are read by libdxfrw but still not applied to
+  either rendering path. `.lff` parsing/glyph-stroke geometry lives in
+  `src/lff_font.*`; font *lookup on disk* (directory scan, per-stem cache,
+  the `unicode.lff` fallback for a codepoint the resolved font doesn't
+  define) lives in `viewer_widget.cpp` rather than `dwg_document.*`, same
+  Qt/filesystem-free-model-layer reasoning as `Shape::color`/`dashPattern`.
+  Fonts are looked up next to the built executable
+  (`<exe_dir>/resources/fonts/*.lff`, copied there by a CMake post-build
+  step, not bundled as Qt resources) so they can be replaced without a
+  rebuild. Accented Latin glyphs (Ç, É, Ã, ...) aren't given full standalone
+  geometry in these fonts -- a glyph section can contain a `C<hex-codepoint>`
+  line (e.g. `Ç`'s own section is just `C0043` plus a couple of extra
+  strokes for the cedilla), meaning "start from this other codepoint's own
+  resolved glyph, then add these marks". `LffFont::loadFromFile` resolves
+  this in a second pass after the whole file is parsed (`resolveGlyph`,
+  memoized, with a cycle guard) rather than inline, so a composition
+  reference can point at a base letter defined later in the file. Missing
+  this originally meant every accented character rendered as only its
+  diacritic mark with no base letter underneath.
 - No file-open dialog / drag-and-drop — single file via argv on purpose,
   to keep "does the architecture work" separate from "is this a full app".
 

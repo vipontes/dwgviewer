@@ -162,6 +162,10 @@ void DwgDocument::addLType(const DRW_LType &data) {
     linePatterns_[data.name] = data.path;
 }
 
+void DwgDocument::addTextStyle(const DRW_Textstyle &data) {
+    textStyleFonts_[data.name] = data.font;
+}
+
 namespace {
 // Looks up a DOUBLE-typed header variable under either its DXF-style
 // "$NAME" key or the DWG reader's bare "NAME" key (see the $LTSCALE
@@ -297,6 +301,7 @@ Shape DwgDocument::makeTextShape(const DRW_Text &data) const {
     s.textHeightDoc = data.height;
     s.textAngleRad = data.angle * M_PI / 180.0;
     s.color = resolveEntityColor(data);
+    if (auto it = textStyleFonts_.find(data.style); it != textStyleFonts_.end()) s.fontFile = it->second;
 
     switch (data.alignH) {
         case DRW_Text::HCenter:
@@ -343,6 +348,7 @@ Shape DwgDocument::makeMTextShape(const DRW_MText &data) const {
     s.textAngleRad = data.angle * M_PI / 180.0;
     s.color = resolveEntityColor(data);
     s.center = {data.basePoint.x, data.basePoint.y};
+    if (auto it = textStyleFonts_.find(data.style); it != textStyleFonts_.end()) s.fontFile = it->second;
 
     // MTEXT's attachment point (DXF group 71) already combines
     // horizontal+vertical alignment and names the insertion point's role
@@ -739,7 +745,14 @@ void DwgDocument::addShape(Shape shape) {
                 start = nl + 1;
                 lineCount += 1.0;
             }
-            const double w = longestLine * shape.textHeightDoc * 0.6;
+            // 0.9x height/char covers both a typical proportional Qt
+            // fallback font (~0.5-0.6x) and this project's own LFF stroke
+            // fonts (see resources/fonts/*.lff via ViewerWidget::
+            // lffFontFor), whose default LetterSpacing/glyph widths run
+            // noticeably wider -- e.g. romans.lff's "Hello" averages ~0.8x
+            // height per character. Erring wide here only makes zoomFit()
+            // slightly less tight; erring narrow visibly clips real text.
+            const double w = longestLine * shape.textHeightDoc * 0.9;
             const double h = lineCount * shape.textHeightDoc * 1.5;
             bbox_.expand(shape.center.x, shape.center.y);
             bbox_.expand(shape.center.x + w, shape.center.y + h);

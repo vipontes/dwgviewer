@@ -144,6 +144,20 @@ struct Shape {
     TextHAlign textHAlign = TextHAlign::Left;
     TextVAlign textVAlign = TextVAlign::Baseline;
 
+    // Text / MText only. The entity's STYLE table entry's own font file
+    // name (DXF/DWG code 3, e.g. "romans.shx" or "iso.shx"), verbatim and
+    // unresolved -- see DwgDocument::addTextStyle. Empty when the entity's
+    // style name isn't in the file's STYLE table at all (a minimal/hand-
+    // written file that never writes one). Kept as the raw string rather
+    // than resolved to a loaded font here, same reasoning as `color`/
+    // `dashPattern` NOT being resolved in ViewerWidget -- except here it's
+    // the other way around: resolving *which* font file to use is a
+    // document-model question (this project's own STYLE table), but
+    // finding and parsing that file on disk is a rendering concern
+    // (ViewerWidget::lffFontFor), so Shape carries the name, not the
+    // parsed font, keeping this header Qt/filesystem-free.
+    std::string fontFile;
+
     // Hatch only: one or more closed boundary loops (an outer boundary
     // plus any island holes). The viewer fills their union with an
     // even-odd rule so islands read as holes regardless of each loop's own
@@ -231,6 +245,7 @@ public:
     void addSolid(const DRW_Solid &data) override;
     void addTrace(const DRW_Trace &data) override;
     void addLayer(const DRW_Layer &data) override;
+    void addTextStyle(const DRW_Textstyle &data) override;
     void addText(const DRW_Text &data) override;
     void addMText(const DRW_MText &data) override;
     void addBlock(const DRW_Block &data) override;
@@ -255,7 +270,6 @@ public:
     // write()), so they're dead code paths here, kept only to satisfy the
     // pure-virtual interface.
     void addVport(const DRW_Vport &) override {}
-    void addTextStyle(const DRW_Textstyle &) override {}
     void addAppId(const DRW_AppId &) override {}
     void setBlock(int) override {} // never invoked by this vendored reader (see .cpp)
     void addPoint(const DRW_Point &) override {}
@@ -453,6 +467,14 @@ private:
     std::string errorMessage_;
     std::unordered_map<std::string, RgbColor> layerColors_;
     std::unordered_map<std::string, std::string> layerLineTypes_;
+
+    // STYLE table name -> its own font file name (code 3), populated by
+    // addTextStyle -- looked up by makeTextShape/makeMTextShape via each
+    // TEXT/MTEXT entity's own style name (code 7) to fill in Shape::
+    // fontFile. A style name absent from this map (entity references a
+    // style the file's STYLE table never defined) leaves Shape::fontFile
+    // empty, which ViewerWidget treats as "use the Qt fallback font".
+    std::unordered_map<std::string, std::string> textStyleFonts_;
     std::unordered_map<std::string, std::vector<double>> linePatterns_; // raw, unscaled (code-49 values)
     double globalLtScale_ = 1.0; // $LTSCALE header variable
 
