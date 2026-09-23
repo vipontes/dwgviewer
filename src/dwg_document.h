@@ -144,6 +144,16 @@ struct Shape {
     TextHAlign textHAlign = TextHAlign::Left;
     TextVAlign textVAlign = TextVAlign::Baseline;
 
+    // Text / MText only. DXF/DWG code 41 ("width factor" / "Relative X
+    // scale factor") -- a horizontal-only stretch applied on top of the
+    // glyphs' own uniform height scale, e.g. 0.8 draws visibly narrower/
+    // more condensed characters than 1.0. This is DRW_Text::widthscale
+    // verbatim (already resolved per-entity by libdxfrw; DRW_MText inherits
+    // the same field). See ViewerWidget's Text case for why this can't go
+    // through documentToScreen_ like Line/Circle/Polyline do -- same
+    // "build a local screen-space transform" reasoning as textAngleRad.
+    double textWidthFactor = 1.0;
+
     // Text / MText only. The entity's STYLE table entry's own font file
     // name (DXF/DWG code 3, e.g. "romans.shx" or "iso.shx"), verbatim and
     // unresolved -- see DwgDocument::addTextStyle. Empty when the entity's
@@ -326,6 +336,23 @@ private:
     // so they must never be counted in the auto-fit bounding box -- only
     // resolveInserts() pushes their transformed copies into shapes_.
     void addShape(Shape shape);
+
+    // True if a top-level entity (one reached with insideBlock_ false) is on
+    // Model Space and should be rendered. This viewer has no concept of
+    // paper space layouts/viewports at all (see CLAUDE.md's "not
+    // implemented yet" list) -- it only ever intends to show Model Space,
+    // the same content a CAD editor's "Model" tab shows. Every genuine
+    // top-level add*() callback (addLine/addText/addInsert/... -- the ones
+    // DRW_Interface actually calls with parsed file data, not the internal
+    // dimension-geometry helpers those call into) checks this first and
+    // returns early when it's false, same shape as the insideBlock_ check
+    // addShape() itself already does. Block-local geometry is exempt --
+    // called with insideBlock_ true, where an entity's own space is not
+    // meaningful (it isn't placed until resolveInserts() transforms a copy
+    // per already-Model-Space-filtered INSERT).
+    bool isModelSpaceEntity_(DRW::Space space) const {
+        return insideBlock_ || space == DRW::ModelSpace;
+    }
 
     // Builds a Text-kind Shape from a DRW_Text/DRW_MText/DRW_Attrib without
     // pushing it anywhere (unlike addText/addMText, which call addShape()

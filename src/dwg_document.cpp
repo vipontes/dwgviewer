@@ -300,6 +300,7 @@ Shape DwgDocument::makeTextShape(const DRW_Text &data) const {
     s.text = expandPercentCodes(data.text);
     s.textHeightDoc = data.height;
     s.textAngleRad = data.angle * M_PI / 180.0;
+    s.textWidthFactor = data.widthscale;
     s.color = resolveEntityColor(data);
     if (auto it = textStyleFonts_.find(data.style); it != textStyleFonts_.end()) s.fontFile = it->second;
 
@@ -346,6 +347,17 @@ Shape DwgDocument::makeMTextShape(const DRW_MText &data) const {
     s.text = sanitizeMTextContent(data.text);
     s.textHeightDoc = data.height;
     s.textAngleRad = data.angle * M_PI / 180.0;
+    // NOT data.widthscale here, unlike makeTextShape -- DRW_MText reuses the
+    // field it inherits from DRW_Text for a completely different quantity,
+    // the MTEXT reference rectangle's wrap width (DXF/DWG code 41 means
+    // "reference rectangle width" for MTEXT, not "width factor" like it does
+    // for TEXT; see DRW_MText::parseDwg's own "/* Rect width BD 41 */"
+    // comment and parseCode's fallthrough to DRW_Text::parseCode for the DXF
+    // path). That's a document-space length (often tens/hundreds of units),
+    // nothing like a ~0.5-2 glyph stretch factor -- treating it as one blew
+    // up affected MTEXT far past the visible canvas. MTEXT has no per-entity
+    // width-factor equivalent in the format at all, so this stays at Shape's
+    // default (1.0, no stretch).
     s.color = resolveEntityColor(data);
     s.center = {data.basePoint.x, data.basePoint.y};
     if (auto it = textStyleFonts_.find(data.style); it != textStyleFonts_.end()) s.fontFile = it->second;
@@ -379,11 +391,13 @@ Shape DwgDocument::makeAttribShape(const DRW_Attrib &attrib) const {
 }
 
 void DwgDocument::addText(const DRW_Text &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s = makeTextShape(data);
     if (!s.text.empty()) addShape(std::move(s));
 }
 
 void DwgDocument::addMText(const DRW_MText &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s = makeMTextShape(data);
     if (!s.text.empty()) addShape(std::move(s));
 }
@@ -418,6 +432,7 @@ void DwgDocument::endBlock() {
 }
 
 void DwgDocument::addInsert(const DRW_Insert &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     PendingInsert ins;
     ins.blockName = data.name;
     ins.insertionPoint = {data.basePoint.x, data.basePoint.y};
@@ -771,6 +786,7 @@ void DwgDocument::addShape(Shape shape) {
 }
 
 void DwgDocument::addLine(const DRW_Line &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s;
     s.kind = ShapeKind::Line;
     s.points.push_back({data.basePoint.x, data.basePoint.y});
@@ -781,6 +797,7 @@ void DwgDocument::addLine(const DRW_Line &data) {
 }
 
 void DwgDocument::addCircle(const DRW_Circle &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s;
     s.kind = ShapeKind::Circle;
     s.center = {data.basePoint.x, data.basePoint.y};
@@ -791,6 +808,7 @@ void DwgDocument::addCircle(const DRW_Circle &data) {
 }
 
 void DwgDocument::addArc(const DRW_Arc &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s;
     s.kind = ShapeKind::Arc;
     s.center = {data.basePoint.x, data.basePoint.y};
@@ -803,15 +821,18 @@ void DwgDocument::addArc(const DRW_Arc &data) {
 }
 
 void DwgDocument::addSolid(const DRW_Solid &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     addShape(buildFilledQuadShape(data, resolveEntityColor(data)));
 }
 
 void DwgDocument::addTrace(const DRW_Trace &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     addShape(buildFilledQuadShape(data, resolveEntityColor(data)));
 }
 
 void DwgDocument::addHatch(const DRW_Hatch *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
 
     Shape s;
     s.kind = ShapeKind::Hatch;
@@ -1219,6 +1240,7 @@ void DwgDocument::addAngularStyleDimension(const DRW_Dimension &dim, Point2D ver
 
 void DwgDocument::addDimAlign(const DRW_DimAligned *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D p1{data->getDef1Point().x, data->getDef1Point().y};
     const Point2D p2{data->getDef2Point().x, data->getDef2Point().y};
     const Point2D dimLinePt{data->getDimPoint().x, data->getDimPoint().y};
@@ -1228,6 +1250,7 @@ void DwgDocument::addDimAlign(const DRW_DimAligned *data) {
 
 void DwgDocument::addDimLinear(const DRW_DimLinear *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D p1{data->getDef1Point().x, data->getDef1Point().y};
     const Point2D p2{data->getDef2Point().x, data->getDef2Point().y};
     const Point2D dimLinePt{data->getDimPoint().x, data->getDimPoint().y};
@@ -1237,6 +1260,7 @@ void DwgDocument::addDimLinear(const DRW_DimLinear *data) {
 
 void DwgDocument::addDimRadial(const DRW_DimRadial *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D center{data->getCenterPoint().x, data->getCenterPoint().y};
     const Point2D onCircle{data->getDiameterPoint().x, data->getDiameterPoint().y};
     const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
@@ -1253,6 +1277,7 @@ void DwgDocument::addDimRadial(const DRW_DimRadial *data) {
 
 void DwgDocument::addDimDiametric(const DRW_DimDiametric *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D p1{data->getDiameter1Point().x, data->getDiameter1Point().y};
     const Point2D p2{data->getDiameter2Point().x, data->getDiameter2Point().y};
     const Point2D textAnchor{data->getTextPoint().x, data->getTextPoint().y};
@@ -1269,6 +1294,7 @@ void DwgDocument::addDimDiametric(const DRW_DimDiametric *data) {
 
 void DwgDocument::addDimAngular(const DRW_DimAngular *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D p1a{data->getFirstLine1().x, data->getFirstLine1().y};
     const Point2D p1b{data->getFirstLine2().x, data->getFirstLine2().y};
     const Point2D p2a{data->getSecondLine1().x, data->getSecondLine1().y};
@@ -1285,6 +1311,7 @@ void DwgDocument::addDimAngular(const DRW_DimAngular *data) {
 
 void DwgDocument::addDimAngular3P(const DRW_DimAngular3p *data) {
     if (!data) return;
+    if (!isModelSpaceEntity_(data->space)) return;
     const Point2D vertex{data->getVertexPoint().x, data->getVertexPoint().y};
     const Point2D p1{data->getFirstLine().x, data->getFirstLine().y};
     const Point2D p2{data->getSecondLine().x, data->getSecondLine().y};
@@ -1302,6 +1329,7 @@ void DwgDocument::addDimAngular3P(const DRW_DimAngular3p *data) {
 // (nearest the annotated feature) when enabled.
 void DwgDocument::addLeader(const DRW_Leader *data) {
     if (!data || data->vertexlist.size() < 2) return;
+    if (!isModelSpaceEntity_(data->space)) return;
 
     Shape s;
     s.kind = ShapeKind::Polyline;
@@ -1335,6 +1363,7 @@ void DwgDocument::addLeader(const DRW_Leader *data) {
 }
 
 void DwgDocument::addLWPolyline(const DRW_LWPolyline &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s;
     s.kind = ShapeKind::Polyline;
     s.closed = (data.flags & 1) != 0;
@@ -1358,6 +1387,7 @@ void DwgDocument::addLWPolyline(const DRW_LWPolyline &data) {
 }
 
 void DwgDocument::addPolyline(const DRW_Polyline &data) {
+    if (!isModelSpaceEntity_(data.space)) return;
     Shape s;
     s.kind = ShapeKind::Polyline;
     s.closed = (data.flags & 1) != 0;

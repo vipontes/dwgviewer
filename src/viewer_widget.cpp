@@ -915,6 +915,17 @@ void ViewerWidget::paintEvent(QPaintEvent *) {
                 painter.resetTransform();
                 painter.translate(originScreen);
                 painter.rotate(-s.textAngleRad * 180.0 / M_PI);
+                // Width factor (DXF/DWG code 41) stretches/condenses glyphs
+                // along the text's own reading direction only, never its
+                // height -- applied here, after the rotate, so it scales the
+                // local (already-rotated) x-axis rather than document X.
+                // Cosmetic (always-0-width) pens stay constant-width in
+                // device pixels under a non-uniform QPainter scale, so this
+                // doesn't distort LFF glyph stroke thickness. A malformed
+                // file with a non-positive width factor falls back to 1.0
+                // rather than drawing zero-width or mirrored text.
+                const double widthFactor = s.textWidthFactor > 0.0 ? s.textWidthFactor : 1.0;
+                painter.scale(widthFactor, 1.0);
 
                 // Only entities whose STYLE table names a font this project
                 // actually ships a .lff for take this path (see

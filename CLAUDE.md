@@ -115,6 +115,31 @@ make -j$(nproc)
 ./dwgviewer path/to/file.dxf --png out.png 800x600   # headless
 ```
 
+## Model Space only -- Paper Space entities are filtered out
+
+This viewer has no concept of paper space layouts/viewports at all (see
+"Not implemented yet" below) -- it only ever intends to show the same
+content a CAD editor's "Model" tab shows. Every genuine top-level
+`DRW_Interface` callback (`addLine`/`addText`/`addInsert`/... -- not the
+internal dimension-geometry helpers those call into) checks
+`DwgDocument::isModelSpaceEntity_(data.space)` first and returns early
+when an entity's own `DRW::Space` (DXF/DWG code 67) says `PaperSpace`,
+mirroring the `insideBlock_` early-return `addShape()` already had.
+Block-local geometry (reached with `insideBlock_` true) is exempt --
+inside a block definition an entity's own space isn't meaningful, since it
+isn't placed anywhere until `resolveInserts()` transforms a copy per an
+INSERT that has *itself* already passed this same check.
+
+Fixed after a real file (`TEST_FILE.dwg`) rendered two extra tables
+(a revision log and an item/quantity table) that don't appear when the
+same file is opened in a real CAD editor. They turned out to be genuine,
+non-erased Paper Space content -- most of the two tables' own LINE/TEXT/
+MTEXT geometry was authored directly in Paper Space rather than through
+any block, so a narrower fix aimed only at the two suspicious `INSERT`s
+(`LEGENDA`/`MOD_REV`) wasn't enough; the fix had to cover every entity
+callback uniformly. Confirmed harmless for Model-Space-only files (DXF's
+`basic.dxf` sample renders byte-identical shape count before/after).
+
 ## Not implemented yet (known gaps, not bugs)
 
 - Entity types beyond `LINE`/`CIRCLE`/`ARC`/`LWPOLYLINE`/`POLYLINE`/`TEXT`/
@@ -275,9 +300,26 @@ make -j$(nproc)
   A style naming anything else (a TTF font, an SHX with no shipped
   equivalent, or no `STYLE` table entry at all) falls back to the system
   Qt font at the entity's DXF height, exactly as before this was
-  implemented. Width-factor/oblique (`STYLE` codes 41/50, `DRW_Text`'s own
-  `widthscale`/`oblique`) are read by libdxfrw but still not applied to
-  either rendering path. `.lff` parsing/glyph-stroke geometry lives in
+  implemented. Width factor (DXF/DWG code 41, `Shape::textWidthFactor`) is
+  applied to both rendering paths as a horizontal-only `QPainter::scale`
+  in the text's own local (already-rotated) screen-space transform (see
+  the `ShapeKind::Text` case in `viewer_widget.cpp`) -- but only for
+  `TEXT`/`ATTRIB`/`ATTDEF` (`DwgDocument::makeTextShape`). `MTEXT` does
+  NOT carry this through, on purpose:
+  `DRW_MText::parseDwg`/`parseCode` (`third_party/libdxfrw`) reuse the
+  same `widthscale` field MTEXT inherits from `DRW_Text` for a completely
+  different quantity -- the MTEXT entity's own reference-rectangle wrap
+  width (DXF/DWG code 41 means "reference rectangle width" for MTEXT, not
+  "width factor" like it does for TEXT; see `DRW_MText::parseDwg`'s own
+  `/* Rect width BD 41 */` comment). That's a document-space length
+  (often tens/hundreds of units), not a ~0.5-2 glyph stretch factor --
+  wiring it into `textWidthFactor` the same way as TEXT sent affected
+  MTEXT shapes' rendering wildly off-canvas (confirmed against this
+  project's own `TEST_FILE.dwg`, whose callout/label text is MTEXT).
+  MTEXT has no per-entity width-factor equivalent in the format at all,
+  so `makeMTextShape` leaves `Shape::textWidthFactor` at its default
+  (1.0, no stretch). Oblique angle (`STYLE` code 50 / `DRW_Text::oblique`)
+  is a separate, still-unapplied gap. `.lff` parsing/glyph-stroke geometry lives in
   `src/lff_font.*`; font *lookup on disk* (directory scan, per-stem cache,
   the `unicode.lff` fallback for a codepoint the resolved font doesn't
   define) lives in `viewer_widget.cpp` rather than `dwg_document.*`, same
