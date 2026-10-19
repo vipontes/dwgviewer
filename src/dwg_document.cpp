@@ -231,7 +231,7 @@ std::string expandPercentCodes(const std::string &raw) {
             switch (std::tolower(static_cast<unsigned char>(raw[i + 2]))) {
                 case 'd': out += "\xC2\xB0"; i += 2; continue; // degree sign
                 case 'p': out += "\xC2\xB1"; i += 2; continue; // plus-minus
-                case 'c': out += "\xC3\x98"; i += 2; continue; // diameter (Ø)
+                case 'c': out += "\xC3\x98"; i += 2; continue; // diameter (Ã˜)
                 case '%': out += '%';        i += 2; continue;
                 // Underline/overline are toggle codes, not literal
                 // characters -- this viewer doesn't render underline/
@@ -419,11 +419,36 @@ void DwgDocument::addAttDef(const DRW_Attdef &data) {
     if (!s.text.empty()) addShape(std::move(s));
 }
 
+namespace {
+// "*Model_Space" / "*Paper_Space" / "*Paper_Space0", ... -- layout block
+// records (case varies between writers), as opposed to reusable named or
+// anonymous blocks.
+bool isLayoutBlockName(const std::string &name) {
+    auto startsWithNoCase = [&](const char *prefix) {
+        const size_t n = std::strlen(prefix);
+        if (name.size() < n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::tolower(static_cast<unsigned char>(name[i])) != prefix[i]) return false;
+        }
+        return true;
+    };
+    return startsWithNoCase("*model_space") || startsWithNoCase("*paper_space");
+}
+} // namespace
+
 void DwgDocument::addBlock(const DRW_Block &data) {
     insideBlock_ = true;
     currentBlockName_ = data.name;
     BlockDef &block = blocks_[currentBlockName_]; // creates it if new
     block.basePoint = {data.basePoint.x, data.basePoint.y};
+
+    // A BLOCK entity's owner is its BLOCK_RECORD -- the same handle every
+    // entity inside this block carries as its own owner. Model/Paper Space
+    // are left out on purpose: their content is the top-level drawing, not
+    // a reusable block, and must never be re-routed by addInsert().
+    if (data.parentHandle != DRW::NoHandle && !isLayoutBlockName(data.name)) {
+        blockNameByRecordHandle_[data.parentHandle] = data.name;
+    }
 }
 
 void DwgDocument::endBlock() {
@@ -432,6 +457,26 @@ void DwgDocument::endBlock() {
 }
 
 void DwgDocument::addInsert(const DRW_Insert &data) {
+    // An attributed INSERT nested in a block definition reaches us only
+    // after that block's endBlock() (see blockNameByRecordHandle_ in the
+    // header). Re-open the owning block's scope for the duration of this
+    // call so the INSERT (and its ATTRIBs, whose coordinates are in that
+    // block's local space) land in that block exactly as if libdxfrw had
+    // delivered it in order -- otherwise it renders once at top level in
+    // block-local coordinates (wrong position/scale) instead of once per
+    // placement of its parent block.
+    if (!insideBlock_) {
+        auto owner = blockNameByRecordHandle_.find(data.parentHandle);
+        if (owner != blockNameByRecordHandle_.end()) {
+            insideBlock_ = true;
+            currentBlockName_ = owner->second;
+            addInsert(data);
+            insideBlock_ = false;
+            currentBlockName_.clear();
+            return;
+        }
+    }
+
     if (!isModelSpaceEntity_(data.space)) return;
     PendingInsert ins;
     ins.blockName = data.name;

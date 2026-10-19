@@ -274,6 +274,18 @@ callback uniformly. Confirmed harmless for Model-Space-only files (DXF's
   approximated for circles/arcs/text (see `effectiveScale`/
   `effectiveRotation` in `dwg_document.cpp`) since `Shape` has no ellipse
   representation.
+  - **Vendored reader gap** (not patched, flagging per the policy above):
+    libdxfrw's DWG reader (`dwgReader::readDwgEntity`'s INSERT case,
+    `dwgreader.cpp`) defers every INSERT that has ATTRIBs to the end of
+    `readDwgEntities()`, after *all* block scopes have closed -- so an
+    attributed INSERT nested in another block's definition reaches
+    `addInsert()` looking like a top-level one. `addInsert()` re-routes it
+    into its owning block via `DRW_Entity::parentHandle` (the owner
+    BLOCK_RECORD handle, mapped to a name in `addBlock()` as
+    `blockNameByRecordHandle_`). Without this, such a block rendered once at
+    top level in its parent block's local coordinates (wrong position and
+    scale) -- confirmed against `TEST_FILE.dwg`'s `MOD_REV`, nested in
+    `FORMATO-A4` (inserted at scale 4.5).
 - ATTRIB/ATTDEF (block attribute text) render for the common cases: a
   per-instance ATTRIB attached to an INSERT, and a CONSTANT ATTDEF (no
   per-instance value ever exists for those). A non-constant ATTDEF with no

@@ -568,6 +568,17 @@ private:
     bool insideBlock_ = false;
     std::string currentBlockName_;
 
+    // BLOCK_RECORD handle -> block name, for every named (non-Model/Paper
+    // Space) block seen by addBlock(). Needed because libdxfrw's DWG reader
+    // defers any INSERT that carries ATTRIBs until after *every* block scope
+    // has closed (dwgreader.cpp, readDwgEntity's INSERT case and the
+    // m_pendingInserts pass at the end of readDwgEntities) -- so an
+    // attributed INSERT nested inside another block's definition arrives at
+    // addInsert() with insideBlock_ false. Its own owner handle
+    // (DRW_Entity::parentHandle) is the only remaining link back to the
+    // block it belongs to; see addInsert().
+    std::unordered_map<std::uint32_t, std::string> blockNameByRecordHandle_;
+
     // True while loadFile() is reading a .dwg. libdxfrw stores some angles
     // raw in each format's own unit (DXF degrees, DWG radians) -- see
     // addHatch's use of DRW_Hatch::angle.
